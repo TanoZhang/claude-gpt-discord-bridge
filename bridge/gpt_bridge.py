@@ -1409,6 +1409,8 @@ def make_bridge(cfg: dict, state: dict):
             if not summary.strip() and self.state.get("recent_replies"):
                 summary = S("recent_header") + "\n\n" + "\n\n---\n\n".join(self.state["recent_replies"])
             first = self.cfg["intro"]
+            if self.cfg.get("intro_update"):  # a new chat needs the latest update too
+                first += "\n\n" + self.cfg["intro_update"]
             if summary.strip():
                 first += "\n\n" + S("handoff_header") + "\n" + summary.strip()
             url = await self.gpt.new_chat(first)
