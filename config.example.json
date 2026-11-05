@@ -1,0 +1,31 @@
+{
+  "channel_id": "000000000000000000",
+  "owner_id": "000000000000000000",
+  "claude_bot_id": "000000000000000000",
+  "gpt_bot_id": "000000000000000000",
+
+  "chat_url": "https://chatgpt.com/g/g-p-xxxxxxxx/c/xxxxxxxx",
+  "project_url": "https://chatgpt.com/g/g-p-xxxxxxxx/project",
+
+  "claude": {
+    "workdir": "C:\\path\\to\\your\\project",
+    "model": "sonnet",
+    "name": "Group Claude",
+    "permission_mode": "auto",
+    "prompt_template": "prompts/claude-prompt.md"
+  },
+
+  "loop_cap": 4,
+  "mirror_interval_s": 60,
+  "rollover_turns": 40,
+  "reply_timeout_s": 900,
+  "first_token_timeout_s": 120,
+  "quiet_period_s": 3,
+  "context_max_chars": 12000,
+  "reload_if_idle_s": 120,
+  "browser_mode": "headless",
+  "browser_channel": "chrome",
+  "access_file": "~/.claude/channels/discord/access.json",
+
+  "strings": {}
+}

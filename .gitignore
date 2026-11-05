@@ -1,0 +1,12 @@
+# secrets and personal settings
+config.json
+gpt-bot.env
+.env
+
+# runtime: state, logged-in browser profile, logs, attachment folders
+data/
+
+# python
+.venv/
+__pycache__/
+*.pyc
