@@ -501,6 +501,29 @@ LAST_TURN_JS = r"""
 }
 """.replace("__DOM_TO_MARKDOWN__", DOM_TO_MARKDOWN.strip())
 
+# Every turn after the one with key sel.seen: [{key, state, userText, text}], oldest first.
+# found=false when that key is not on the page (another chat, or turns not rendered).
+TURNS_AFTER_JS = r"""
+(sel) => {
+  const conv = __DOM_TO_MARKDOWN__;
+  const turns = Array.from(document.querySelectorAll(sel.turn));
+  const stAttr = sel.turn_state.replace(/[\[\]]/g, '').split('=')[0];
+  const keyOf = (t, i) => t.getAttribute('data-turn-key') || String(i + 1);
+  const at = turns.findIndex((t, i) => keyOf(t, i) === sel.seen);
+  if (at < 0) return { found: false, turns: [] };
+  return { found: true, turns: turns.slice(at + 1).map((t, j) => {
+    const st = t.matches(sel.turn_state) ? t : t.querySelector(sel.turn_state);
+    const user = t.querySelector(sel.user_unit);
+    return {
+      key: keyOf(t, at + 1 + j),
+      state: st ? st.getAttribute(stAttr) : null,
+      userText: user ? user.innerText : '',
+      text: Array.from(t.querySelectorAll(sel.assistant_content)).map(conv).filter(s => s.trim()).join('\n\n'),
+    };
+  }) };
+}
+""".replace("__DOM_TO_MARKDOWN__", DOM_TO_MARKDOWN.strip())
+
 # Keep whatever the page copies inside the page (window.__bridgeCopied) instead of the
 # system clipboard, so the reply's own Copy button gives us its markdown source.
 COPY_HOOK_JS = r"""
@@ -921,9 +944,11 @@ class ChatGPT:
             log.exception("collecting reply files failed")
             return []
 
-    async def check_for_web_turn(self, seen_key: str | None) -> dict | None:
-        """Reload the chat; if its last turn is new (typed in ChatGPT itself) and finished,
-        return {key, user, text, outputs}. Returns None when there is nothing new."""
+    async def check_for_web_turns(self, seen_key: str | None) -> dict | None:
+        """Reload the chat and return {key, items} for the turns after seen_key: items are the
+        finished turns typed in ChatGPT itself, [{user, text, outputs}], oldest first; key is the
+        newest finished turn. A turn still being answered is left for the next look. Turns the
+        bridge sent (they start with a [speaker] tag) are skipped. Returns None when nothing is new."""
         await self.open_chat()
         turn = await self.last_turn()
         for _ in range(15):  # turns render a moment after the composer appears
@@ -933,18 +958,34 @@ class ChatGPT:
             turn = await self.last_turn()
         await asyncio.sleep(1)
         turn = await self.last_turn()
-        if not turn["key"] or turn["key"] == seen_key or turn["state"] not in (None, self.sel["turn_done"]):
+        if not turn["key"] or turn["key"] == seen_key:
             return None
-        if self.page and await self.page.locator(self.sel["stop"]).first.is_visible():
-            return None
+        last_busy = turn["state"] not in (None, self.sel["turn_done"])
+        if not last_busy and self.page and await self.page.locator(self.sel["stop"]).first.is_visible():
+            last_busy = True
         if seen_key is None:  # first look after start: remember, do not replay history
-            return {"key": turn["key"], "skip": True}
-        if re.match(r"^\[[^\]]{1,32}\]", (turn["userText"] or "").strip()):
-            return {"key": turn["key"], "skip": True}  # a turn the bridge itself sent
-        text = turn["text"] or turn.get("fallback", "")
-        if text:
-            text = (await self.copied_reply()) or text
-        return {"key": turn["key"], "user": turn["userText"], "text": text, "outputs": await self.outputs_of_last_turn()}
+            return None if last_busy else {"key": turn["key"], "items": []}
+        after = await self.page.evaluate(TURNS_AFTER_JS, {**self.sel, "seen": seen_key})
+        turns = after["turns"] if after.get("found") else [
+            {"key": turn["key"], "state": turn["state"], "userText": turn["userText"], "text": turn["text"]}]
+        key, items = seen_key, []
+        for n, t in enumerate(turns):
+            is_last = n == len(turns) - 1
+            if is_last and last_busy:
+                break
+            if not is_last and t["state"] not in (None, self.sel["turn_done"]):
+                break
+            key = t["key"]
+            if re.match(r"^\[[^\]]{1,32}\]", (t["userText"] or "").strip()):
+                continue  # a turn the bridge itself sent
+            text, outputs = t["text"], []
+            if is_last:
+                text = turn["text"] or turn.get("fallback", "") or text
+                if text:
+                    text = (await self.copied_reply()) or text
+                outputs = await self.outputs_of_last_turn()
+            items.append({"user": t["userText"], "text": text, "outputs": outputs})
+        return None if key == seen_key else {"key": key, "items": items}
 
     async def collect_outputs(self, dest: Path) -> list[Path]:
         """Save the last reply's files (its Download buttons) and images into dest."""
@@ -1388,19 +1429,18 @@ def make_bridge(cfg: dict, state: dict):
                     continue
                 try:
                     async with self.page_lock:
-                        found = await self.gpt.check_for_web_turn(self.state.get("last_turn_key"))
+                        found = await self.gpt.check_for_web_turns(self.state.get("last_turn_key"))
                     if not found:
                         continue
                     self.state["last_turn_key"] = found["key"]
                     save_json(STATE_FILE, self.state)
-                    user = (found.get("user") or "").strip()
-                    if found.get("skip") or re.match(r"^\[[^\]]{1,32}\]", user):
-                        continue  # first look, or a turn the bridge itself sent
-                    self.state["turns_in_chat"] = int(self.state.get("turns_in_chat", 0)) + 1
-                    self.streak, self.capped = 0, False  # a human started this turn
-                    quote = "\n".join("> " + line for line in user[:800].splitlines() if line.strip())
-                    log.info("mirroring a turn typed in ChatGPT (%d chars)", len(found["text"]))
-                    await self.post_reply(f"{S('mirror_header')}\n{quote}\n\n{found['text']}", True, found["outputs"])
+                    for item in found["items"]:
+                        user = (item["user"] or "").strip()
+                        self.state["turns_in_chat"] = int(self.state.get("turns_in_chat", 0)) + 1
+                        self.streak, self.capped = 0, False  # a human started this turn
+                        quote = "\n".join("> " + line for line in user[:800].splitlines() if line.strip())
+                        log.info("mirroring a turn typed in ChatGPT (%d chars)", len(item["text"]))
+                        await self.post_reply(f"{S('mirror_header')}\n{quote}\n\n{item['text']}", True, item["outputs"])
                 except NeedsHuman as e:
                     log.warning("mirror check needs the user: %s", e)
                 except Exception:
