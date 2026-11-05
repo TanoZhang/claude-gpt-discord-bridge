@@ -101,3 +101,33 @@ if (isPluginServer && (ALLOW.length > 0 || SKIP_TO.length > 0)) {
   EventEmitter.prototype.addListener = wrapped
   log(`active allow=[${ALLOW}] skipTo=[${SKIP_TO}] requireMention=${REQUIRE_MENTION}`)
 }
+
+// Optional: DISCORD_PERMISSION_CHANNEL_ID=<channel id> posts Claude's permission prompts
+// (Allow / Deny buttons) in that channel, mentioning the user, instead of a DM to each
+// allowlisted user. The plugin's own button handler still checks that whoever clicks is
+// in access.json allowFrom, so other members and bots cannot approve.
+import { createRequire } from 'node:module' // hoisted: loads before the plugin code runs
+const PERM_CHANNEL = process.env.DISCORD_PERMISSION_CHANNEL_ID
+if (isPluginServer && PERM_CHANNEL) {
+  try {
+    const { User } = createRequire(process.argv[1])('discord.js')
+    const origSend = User.prototype.send
+    const posted = new Set() // one channel post per request, though the plugin DMs every allowlisted user
+    User.prototype.send = async function (options) {
+      const content = typeof options === 'string' ? options : options?.content
+      if (typeof content !== 'string' || !content.startsWith('🔐 Permission:') || !options?.components?.length) {
+        return origSend.call(this, options)
+      }
+      const key = JSON.stringify(options.components.map((c) => (typeof c.toJSON === 'function' ? c.toJSON() : c)))
+      if (posted.has(key)) return null
+      posted.add(key)
+      if (posted.size > 200) posted.delete(posted.values().next().value)
+      const ch = await this.client.channels.fetch(PERM_CHANNEL)
+      log(`permission prompt -> channel ${PERM_CHANNEL}`)
+      return ch.send({ ...options, content: `<@${this.id}> ${content}`, allowedMentions: { users: [this.id] } })
+    }
+    log(`permission prompts go to channel ${PERM_CHANNEL}`)
+  } catch (e) {
+    log(`permission redirect failed: ${e}`)
+  }
+}

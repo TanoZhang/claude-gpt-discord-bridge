@@ -22,6 +22,7 @@ Set-Content -Path $prompt -Value $text -Encoding UTF8
 $env:BUN_OPTIONS = '--preload=' + ((Join-Path $root 'plugin-patch\allow-bots.mjs') -replace '\\', '/')
 $env:DISCORD_ALLOW_BOT_IDS = $cfg.gpt_bot_id
 $env:DISCORD_SKIP_HUMAN_TO_BOT_IDS = $cfg.gpt_bot_id
+if ($cfg.permissions_in_channel) { $env:DISCORD_PERMISSION_CHANNEL_ID = $cfg.channel_id }  # Allow/Deny buttons in the channel
 
 $claude = (Get-Command claude -ErrorAction SilentlyContinue).Source
 if (-not $claude) { $claude = Join-Path $env:USERPROFILE '.local\bin\claude.exe' }

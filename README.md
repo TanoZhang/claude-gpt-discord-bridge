@@ -44,7 +44,8 @@ So the design goals became:
 - **Files and images, both ways**: attachments posted to the channel are uploaded to ChatGPT. Files ChatGPT produces (code-interpreter downloads) and images it generates are attached to GPT's message.
 - **Web mirror**: if you type into ChatGPT directly, the bridge notices within a minute and posts your question and the answer to the channel.
 - **Handoff**: `!gpt new` asks the old chat for a handoff summary, then opens a fresh chat in the same ChatGPT project, seeded with the summary. This also happens automatically every `rollover_turns` turns.
-- **Permission prompts**: Claude's tool approvals arrive as Allow/Deny buttons in your DMs. GPT cannot approve anything.
+- **Nothing gets dropped**: if ChatGPT errors out or takes your message back, the batch is requeued and retried after a reload, merged with anything said in the meantime. If ChatGPT says the chat is too long, the bridge rolls over to a new chat and resends.
+- **Permission prompts**: Claude's tool approvals arrive as Allow/Deny buttons, either in the channel (`permissions_in_channel`) or in your DMs. Only allowlisted humans can press them; GPT cannot approve anything.
 
 ## How it works
 
@@ -57,6 +58,7 @@ The official plugin (`discord@claude-plugins-official`) ignores every message fr
 - lets through only bot IDs listed in `DISCORD_ALLOW_BOT_IDS`, and only when they @mention Claude, so Claude is not billed for every GPT message;
 - drops any bot message shaped like a permission reply (`yes abcde`), so a bot can never approve a tool call;
 - optionally skips human messages addressed only to GPT (`DISCORD_SKIP_HUMAN_TO_BOT_IDS`);
+- optionally posts permission prompts in a channel instead of DMs (`DISCORD_PERMISSION_CHANNEL_ID`): it wraps discord.js's `User.send` for messages carrying the plugin's permission buttons, and the plugin's own click handler still checks the allowlist;
 - still goes through the plugin's own `access.json` gate afterwards.
 
 (Bun gives discord.js's client its own instance-level `emit`, so the patch wraps listeners at registration time rather than patching `emit`.)
@@ -68,7 +70,9 @@ The official plugin (`discord@claude-plugins-official`) ignores every message fr
 - **Context sync, not history replay.** The bridge buffers what was said since GPT's last turn and sends it as one speaker-tagged message. GPT always knows the whole conversation, and nothing is sent twice.
 - **Knowing when ChatGPT is done.** It waits until the turn's state is complete, the stop button is gone, and the text, images and files have stayed the same for a few seconds. Long reasoning is allowed up to `reply_timeout_s`; after that it posts what it has.
 - **Exact markdown.** It clicks the reply's own Copy button. The page's clipboard calls are captured *inside the page*, so your system clipboard is never touched. Rendered DOM-to-markdown is the fallback.
-- **Files.** Uploads go through ChatGPT's own file input. Outputs come from the reply's Download buttons and its generated-image gallery. Files are deduplicated by hash, and files over Discord's limit are listed by name.
+- **Files.** Uploads go through ChatGPT's own file input. Outputs come from the reply's Download buttons and its generated-image gallery; link icons and citation favicons are skipped. Files are deduplicated by hash. Files over the server's upload limit (10 MB without boosts, or `max_file_mb`) are listed by name, as are uploads Discord rejects with 413.
+- **Failures.** While waiting, the bridge checks that its message is still in the chat. A vanished message, a ChatGPT error, or a finished turn with nothing in it raises a failure instead of posting an empty reply. The batch goes back to the front of the queue and is retried after 30 s and 60 s; after three failures the bridge says so once and keeps the batch for the next @GPT. Reply shapes it cannot parse are sent as their visible text, and the turn's HTML is saved in `data/logs` so the reader can be fixed.
+- **Discord formatting.** Discord does not render markdown tables, so narrow tables become aligned code blocks and wide ones become bullet lists. Link previews are suppressed.
 - **Mirror.** When idle, it reloads the chat every `mirror_interval_s` seconds. A new finished turn that it did not send itself is one you typed, so it posts that turn.
 - **Loop cap.** The bridge is the one party that can refuse to answer, so the cap lives there.
 - **Selectors are config.** ChatGPT's markup changes. Every selector is in `config.json`, and `--probe` shows what the page looks like without sending anything.
@@ -126,6 +130,8 @@ Stop or restart: `scripts\stop.ps1 [-Restart]`. A restarted Claude session start
 | `reply_timeout_s` | 900 | Longest wait for one reply |
 | `context_max_chars` | 12000 | Most channel text sent to GPT in one turn |
 | `browser_mode` | `headless` | `headless` or `headed` |
+| `permissions_in_channel` | `true` | Claude's Allow/Deny buttons in the channel instead of DMs (takes effect when Claude restarts) |
+| `max_file_mb` | server limit | Cap for files posted to Discord |
 | `intro` / `handoff_prompt` | English | What GPT is told about the group, and how it is asked for a summary |
 | `strings` | `{}` | Override or translate any message the bridge posts |
 | `selectors` | ChatGPT as of 2026-11 | Fix these when ChatGPT's markup changes |

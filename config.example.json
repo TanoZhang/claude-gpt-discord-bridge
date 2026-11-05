@@ -15,6 +15,9 @@
     "prompt_template": "prompts/claude-prompt.md"
   },
 
+  "permissions_in_channel": true,
+  "max_file_mb": null,
+
   "loop_cap": 4,
   "mirror_interval_s": 60,
   "rollover_turns": 40,

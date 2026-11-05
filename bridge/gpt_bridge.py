@@ -89,9 +89,11 @@ DEFAULT_STRINGS = {
     "rollover_done": "New chat: <{url}>",
     "mirror_header": "**(asked directly in ChatGPT)**",
     "attach_failed": "[these attachments could not be passed on: {names}]",
-    "needs_human_ask": "{problem}; this message was not sent to GPT. Send `!gpt show` to open the browser window, `!gpt hide` when done, then @GPT again.",
+    "needs_human_ask": "{problem}; the message is kept. Send `!gpt show` to open the browser window and `!gpt hide` when done: it is then sent again.",
+    "retry_gave_up": "(GPT did not get these messages after {n} tries: {reason}. They stay queued and go out with the next @GPT.)",
+    "reason_too_long": "ChatGPT says the chat is too long",
     "ask_failed": "GPT bridge error ({err}); no reply for this one. Restarting the browser, please @GPT again in a moment.",
-    "too_big": "(These files are over Discord's 10 MB limit and were not sent: {files})",
+    "too_big": "(These files are over Discord's {limit} MB upload limit and were not sent; download them in ChatGPT: {files})",
     "empty": "(GPT returned nothing.)",
     "timeout": "(GPT timed out; above is what it had written so far.)",
     "problem_check": "ChatGPT is showing a human check",
@@ -433,7 +435,15 @@ LAST_TURN_JS = r"""
   const contents = Array.from(last.querySelectorAll(sel.assistant_content));
   // Reply images and files: anywhere in the turn except the user's own message.
   const reply = e => !e.closest(sel.user_part);
-  const imgs = Array.from(last.querySelectorAll('img')).filter(i => reply(i) && i.alt !== 'User attachment' && i.naturalWidth >= 100 && i.naturalHeight >= 100).length;
+  const bigImg = i => reply(i) && i.alt !== 'User attachment' && !i.closest('a') && i.naturalWidth >= 100 && i.naturalHeight >= 100 && i.getBoundingClientRect().width >= 96;
+  const imgs = Array.from(last.querySelectorAll('img')).filter(bigImg).length;
+  let fallback = '';
+  if (!contents.some(c => c.innerText.trim())) {
+    // Unknown reply shape: its visible text, without the user's message, buttons and labels.
+    const clone = last.cloneNode(true);
+    clone.querySelectorAll(sel.user_part + ', button, h4, svg, [aria-hidden="true"], .sr-only').forEach(e => e.remove());
+    fallback = (clone.innerText || clone.textContent || '').replace(/\n{3,}/g, '\n\n').trim();
+  }
   const downloads = Array.from(last.querySelectorAll(sel.download_button)).filter(reply).length;
   return {
     key: last.getAttribute('data-turn-key') || String(turns.length),
@@ -441,7 +451,7 @@ LAST_TURN_JS = r"""
     state: st ? st.getAttribute(stAttr) : null,
     userText: user ? user.innerText : '',
     text: contents.map(conv).filter(s => s.trim()).join('\n\n'),
-    imgs, downloads,
+    imgs, downloads, fallback,
   };
 }
 """.replace("__DOM_TO_MARKDOWN__", DOM_TO_MARKDOWN.strip())
@@ -495,8 +505,8 @@ REPLY_IMAGES_JS = r"""
   const seen = new Set(), out = [];
   for (const img of last.querySelectorAll('img')) {
     const src = img.currentSrc || img.src;
-    if (!src || seen.has(src) || img.closest(sel.user_part) || img.alt === 'User attachment') continue;
-    if (img.naturalWidth < 100 || img.naturalHeight < 100) continue;
+    if (!src || seen.has(src) || img.closest(sel.user_part) || img.closest('a') || img.alt === 'User attachment') continue;
+    if (img.naturalWidth < 100 || img.naturalHeight < 100 || img.getBoundingClientRect().width < 96) continue;
     seen.add(src);
     out.push({ src, alt: img.alt || '' });
   }
@@ -555,6 +565,18 @@ def conv_id(url: str) -> str:
 
 def squash(s: str) -> str:
     return re.sub(r"\s+", "", s or "")
+
+
+class ReplyFailed(Exception):
+    """ChatGPT did not answer our message: it showed an error, or the message vanished."""
+
+    def __init__(self, reason: str, too_long: bool = False):
+        super().__init__(reason)
+        self.too_long = too_long
+
+
+ERROR_RE = re.compile(r"something went wrong|error (generating|occurred)|network error|try again|retry|出错|错误|重试|请稍后", re.I)
+TOO_LONG_RE = re.compile(r"too long|maximum (context|length)|context (window|length)|start a new chat|对话太长|过长|新对话", re.I)
 
 
 class NeedsHuman(Exception):
@@ -674,6 +696,17 @@ class ChatGPT:
     async def last_turn(self) -> dict:
         return await self.page.evaluate(LAST_TURN_JS, self.sel)
 
+    async def dump_turn(self, reason: str) -> None:
+        """Save the last turn's HTML to the log folder, to fix the reader later."""
+        try:
+            html = await self.page.evaluate(
+                "(sel) => { const t = document.querySelectorAll(sel); return t.length ? t[t.length - 1].outerHTML : document.body.outerHTML }",
+                self.sel["turn"])
+            LOG_DIR.mkdir(parents=True, exist_ok=True)
+            (LOG_DIR / f"turn-{reason}-{time.strftime('%Y%m%d-%H%M%S')}.html").write_text(html[:3_000_000], encoding="utf-8")
+        except Exception as e:
+            log.warning("dump_turn failed: %s", e)
+
     async def copied_reply(self) -> str | None:
         """The last reply's markdown, through its own Copy button; None if that fails."""
         try:
@@ -700,7 +733,7 @@ class ChatGPT:
             await asyncio.sleep(1)
         raise RuntimeError("file upload to ChatGPT did not finish")
 
-    async def _send(self, text: str, files: list[Path] | None = None) -> None:
+    async def _send(self, text: str, files: list[Path] | None = None) -> str:
         before = await self.last_turn()
         box = self.page.locator(self.sel["composer"]).first
         await box.click()
@@ -732,18 +765,23 @@ class ChatGPT:
         while time.monotonic() < end:
             now = await self.last_turn()
             if now["key"] != before["key"] and snippet in squash(now["userText"]):
-                return
+                return snippet
             await asyncio.sleep(0.5)
         raise RuntimeError("message did not appear in the chat after sending")
 
-    async def _wait_reply(self) -> tuple[str, bool]:
-        """Return (text, finished). finished=False means timeout with partial text."""
+    async def _wait_reply(self, snippet: str | None = None) -> tuple[str, bool]:
+        """Return (text, finished). finished=False means timeout with partial text.
+        Raises ReplyFailed when ChatGPT shows an error or our message disappears."""
         start = time.monotonic()
         stop_sel = self.sel["stop"]
-        prev, stable = None, 0
+        prev, stable, empty_done, gone = None, 0, 0, 0
         while True:
             elapsed = time.monotonic() - start
             turn = await self.last_turn()
+            if snippet:
+                gone = gone + 1 if snippet not in squash(turn["userText"]) else 0
+                if gone >= 3:  # ChatGPT took the message back (failed send, server error)
+                    raise ReplyFailed("ChatGPT dropped the message")
             text = turn["text"]
             generating = await self.page.locator(stop_sel).first.is_visible()
             done_state = turn["state"] == self.sel["turn_done"]
@@ -758,9 +796,19 @@ class ChatGPT:
                     copied = await self.copied_reply() if text else None
                     return copied or text, True
             prev = seen
+            empty_done = empty_done + 1 if (done_state and not generating and not has_output) else 0
+            if empty_done >= 5 and turn.get("fallback"):
+                fb = turn["fallback"]
+                if len(fb) < 500 and (ERROR_RE.search(fb) or TOO_LONG_RE.search(fb)):
+                    await self.dump_turn("error")
+                    raise ReplyFailed(fb[:300], too_long=bool(TOO_LONG_RE.search(fb)))
+                await self.dump_turn("unparsed")
+                log.warning("reply shape not parsed; sending its visible text (%d chars)", len(fb))
+                return fb, True
             if not has_output and not generating and elapsed > self.cfg["first_token_timeout_s"]:
                 if done_state:
-                    return "", True  # finished with nothing we can show
+                    await self.dump_turn("empty")
+                    raise ReplyFailed("ChatGPT finished without a reply")
                 problem = page_problem(self.page.url, await self.page.title(), await self._body())
                 if problem:
                     raise NeedsHuman(problem)
@@ -772,8 +820,8 @@ class ChatGPT:
     async def ask(self, text: str, files: list[Path] | None = None, collect: bool = True) -> tuple[str, bool, list[Path]]:
         """Send text (+ files); return (reply text, finished, files/images from the reply)."""
         await self.ensure_ready()
-        await self._send(text, files)
-        reply, finished = await self._wait_reply()
+        snippet = await self._send(text, files)
+        reply, finished = await self._wait_reply(snippet)
         outputs = await self.outputs_of_last_turn() if collect else []
         self.last_key = (await self.last_turn())["key"]
         self.last_used = time.monotonic()
@@ -804,7 +852,9 @@ class ChatGPT:
             return None
         if seen_key is None:  # first look after start: remember, do not replay history
             return {"key": turn["key"], "skip": True}
-        text = turn["text"]
+        if re.match(r"^\[[^\]]{1,32}\]", (turn["userText"] or "").strip()):
+            return {"key": turn["key"], "skip": True}  # a turn the bridge itself sent
+        text = turn["text"] or turn.get("fallback", "")
         if text:
             text = (await self.copied_reply()) or text
         return {"key": turn["key"], "user": turn["userText"], "text": text, "outputs": await self.outputs_of_last_turn()}
@@ -907,6 +957,7 @@ def make_bridge(cfg: dict, state: dict):
             self.stopping = False
             self.channel = None
             self.page_lock = asyncio.Lock()
+            self.failures = 0  # failed tries of the current batch
 
         # -- helpers
         @property
@@ -981,7 +1032,7 @@ def make_bridge(cfg: dict, state: dict):
 
         def take_buffer(self) -> tuple[str, list]:
             """Everything said since GPT's last turn, and the attachments in it (newest kept)."""
-            lines = [f"[{s}] {t}" for s, t, _, _ in self.buffer]
+            lines = [t if s is None else f"[{s}] {t}" for s, t, _, _ in self.buffer]
             atts = [a for entry in self.buffer for a in entry[3]]
             self.buffer.clear()
             limit = self.cfg["context_max_chars"]
@@ -1011,7 +1062,7 @@ def make_bridge(cfg: dict, state: dict):
         async def note(self, text: str) -> None:
             try:
                 if self.channel:
-                    await self.channel.send(text, allowed_mentions=discord.AllowedMentions.none())
+                    await self.channel.send(text, allowed_mentions=discord.AllowedMentions.none(), suppress_embeds=True)
             except Exception as e:
                 log.warning("note failed: %s", e)
 
@@ -1110,6 +1161,8 @@ def make_bridge(cfg: dict, state: dict):
                 try:
                     async with self.page_lock:
                         await self.gpt.start("headed" if cmd == "show" else self.cfg["browser_mode"])
+                    if cmd == "hide" and self.buffer:
+                        self.trigger.set()
                     await self.note(S("shown") if cmd == "show" else S("hidden"))
                 except NeedsHuman as e:
                     await self.note(S("shown_problem", problem=e) if cmd == "show" else str(e))
@@ -1164,6 +1217,15 @@ def make_bridge(cfg: dict, state: dict):
                 except Exception:
                     log.exception("mirror check failed")
 
+        def requeue(self, batch: str, atts) -> None:
+            """Put a batch that did not reach GPT back at the front of the buffer."""
+            self.buffer.insert(0, [None, batch, time.monotonic(), list(atts)])
+
+        async def retry_later(self, delay: float) -> None:
+            await asyncio.sleep(delay)
+            if self.buffer:
+                self.trigger.set()
+
         async def worker(self) -> None:
             await self.wait_until_ready()
             while not self.is_closed():
@@ -1171,9 +1233,10 @@ def make_bridge(cfg: dict, state: dict):
                 while time.monotonic() - self.last_msg_at < self.cfg["quiet_period_s"]:
                     await asyncio.sleep(0.5)  # wait for the rest of a multi-chunk message
                 self.trigger.clear()
-                prompt, atts = self.take_buffer()
-                if not prompt:
+                batch, atts = self.take_buffer()
+                if not batch:
                     continue
+                prompt = batch
                 self.busy = True
                 try:
                     if self.channel is None:
@@ -1191,32 +1254,65 @@ def make_bridge(cfg: dict, state: dict):
                         if failed:
                             prompt += "\n\n" + S("attach_failed", names=", ".join(failed))
                         text, finished, outputs = await self.gpt.ask(prompt, files)
+                    self.failures = 0
                     self.state.update(intro_sent=True, intro_version=version, last_turn_key=self.gpt.last_key,
                                       turns_in_chat=int(self.state.get("turns_in_chat", 0)) + 1)
                     save_json(STATE_FILE, self.state)
                     await self.post_reply(text, finished, outputs)
                 except NeedsHuman as e:
                     log.warning("needs human: %s", e)
+                    self.requeue(batch, atts)
                     await self.note(S("needs_human_ask", problem=e))
                 except Exception as e:
-                    log.exception("ask failed")
-                    await self.note(S("ask_failed", err=type(e).__name__))
+                    # Never drop the batch: put it back, then retry (or roll over to a new chat).
+                    self.requeue(batch, atts)
+                    self.failures += 1
+                    tries = self.failures
+                    if isinstance(e, ReplyFailed):
+                        log.warning("reply failed (try %d): %s", tries, e)
+                    else:
+                        log.exception("ask failed (try %d)", tries)
                     try:
-                        await self.gpt.start()
+                        if isinstance(e, ReplyFailed) and e.too_long and tries <= 2:
+                            async with self.page_lock:
+                                await self.rollover(handoff=False, reason=S("reason_too_long"))
+                            self.trigger.set()
+                        elif tries < 3:
+                            async with self.page_lock:
+                                if isinstance(e, ReplyFailed) and self.gpt.alive():
+                                    await self.gpt.open_chat()  # reload: shows the chat as the server has it
+                                else:
+                                    await self.gpt.start()
+                            asyncio.create_task(self.retry_later(30 * tries))
+                        else:
+                            self.failures = 0
+                            await self.note(S("retry_gave_up", n=tries, reason=e))
                     except Exception:
-                        log.exception("browser restart failed")
+                        log.exception("recovery failed")
                 finally:
                     self.busy = False
+
+        def file_limit(self) -> int:
+            """Upload limit in bytes: config max_file_mb, else what the server allows."""
+            mb = self.cfg.get("max_file_mb")
+            if mb:
+                return int(float(mb) * 1048576)
+            guild = getattr(self.channel, "guild", None)
+            return guild.filesize_limit if guild else MAX_DISCORD_FILE
+
+        def too_big_text(self, paths) -> str:
+            return S("too_big", limit=f"{self.file_limit() / 1048576:.0f}", files=", ".join(
+                f"{p.name} {p.stat().st_size / 1048576:.1f} MB" for p in paths))
 
         async def post_reply(self, text: str, finished: bool, outputs: list[Path] = ()) -> None:
             text = re.sub(r"@(?:bot)?claude\b", f"<@{self.claude_id}>", text, flags=re.I)
             text = fence_tables(text)
             text = re.sub(r"@(everyone|here)\b", "@​\\1", text)
-            files = [p for p in outputs if p.stat().st_size <= MAX_DISCORD_FILE]
-            too_big = [p for p in outputs if p.stat().st_size > MAX_DISCORD_FILE]
+            limit = self.file_limit()
+            files = [p for p in outputs if p.stat().st_size <= limit]
+            too_big = [p for p in outputs if p.stat().st_size > limit]
             if too_big:
-                text += "\n\n" + S("too_big", files=", ".join(
-                    f"{p.name} {p.stat().st_size / 1048576:.1f} MB" for p in too_big))
+                text += "\n\n" + self.too_big_text(too_big)
             if not text.strip() and not files:
                 await self.note(S("empty"))
                 return
@@ -1228,12 +1324,20 @@ def make_bridge(cfg: dict, state: dict):
             for i, part in enumerate(parts):
                 last = i == len(parts) - 1
                 if last and files:
-                    # Discord takes at most 10 files per message.
-                    for j in range(0, len(files), 10):
-                        batch = [discord.File(str(p), filename=p.name) for p in files[j:j + 10]]
-                        await self.channel.send(part if j == 0 else None, files=batch)
+                    for j in range(0, len(files), 10):  # Discord takes at most 10 files per message
+                        chunk = files[j:j + 10]
+                        head = part if j == 0 else None
+                        try:
+                            await self.channel.send(head, files=[discord.File(str(p), filename=p.name) for p in chunk],
+                                                    suppress_embeds=True)
+                        except discord.HTTPException as e:
+                            if e.status != 413:
+                                raise
+                            log.warning("upload rejected as too large: %s", [p.name for p in chunk])
+                            await self.channel.send(((head + "\n\n") if head else "") + self.too_big_text(chunk),
+                                                    suppress_embeds=True)
                 else:
-                    await self.channel.send(part)
+                    await self.channel.send(part, suppress_embeds=True)
             self.streak += 1
             log.info("gpt posted %d chars, %d files (streak=%d)", len(text), len(files), self.streak)
 
