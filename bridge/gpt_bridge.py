@@ -1002,6 +1002,9 @@ def make_bridge(cfg: dict, state: dict):
             self.cfg = cfg
             self.state = state
             self.channel_id = int(cfg["channel_id"])
+            self.log_channel_id = int(cfg["log_channel_id"]) if cfg.get("log_channel_id") else None
+            self.log_channel = None
+            self.reply_target = None  # channel the current batch was addressed from
             self.claude_id = int(cfg["claude_bot_id"])
             self.owner_id = int(cfg["owner_id"])
             self.gpt = ChatGPT(cfg, state)
@@ -1057,8 +1060,21 @@ def make_bridge(cfg: dict, state: dict):
 
         def in_channel(self, msg) -> bool:
             ch = msg.channel
-            parent = getattr(ch, "parent_id", None)
-            return ch.id == self.channel_id or parent == self.channel_id
+            ids = {self.channel_id, self.log_channel_id} - {None}
+            return ch.id in ids or getattr(ch, "parent_id", None) in ids
+
+        def is_log(self, msg) -> bool:
+            ch = msg.channel
+            return self.log_channel_id is not None and self.log_channel_id in (ch.id, getattr(ch, "parent_id", None))
+
+        def tag(self, speaker: str, msg) -> str:
+            """Speaker label for GPT; lines from the log channel say so."""
+            return f"{speaker} · #{getattr(msg.channel, 'name', 'log')}" if self.is_log(msg) else speaker
+
+        def target_for(self, msg) -> None:
+            """GPT answers where it was asked; the main channel wins if both asked."""
+            if self.reply_target is None or self.reply_target.id != self.channel_id:
+                self.reply_target = msg.channel
 
         def speaker(self, msg) -> str:
             if msg.author.id == self.owner_id:
@@ -1142,10 +1158,11 @@ def make_bridge(cfg: dict, state: dict):
                     failed.append(a.filename)
             return paths, failed
 
-        async def note(self, text: str) -> None:
+        async def note(self, text: str, log_channel: bool = False) -> None:
             try:
-                if self.channel:
-                    await self.channel.send(text, allowed_mentions=discord.AllowedMentions.none(), suppress_embeds=True)
+                ch = (self.log_channel or self.channel) if log_channel else self.channel
+                if ch:
+                    await ch.send(text, allowed_mentions=discord.AllowedMentions.none(), suppress_embeds=True)
             except Exception as e:
                 log.warning("note failed: %s", e)
 
@@ -1174,6 +1191,8 @@ def make_bridge(cfg: dict, state: dict):
             log.info("discord connected as %s (%s)", self.user, self.user.id)
             try:
                 self.channel = self.get_channel(self.channel_id) or await self.fetch_channel(self.channel_id)
+                if self.log_channel_id:
+                    self.log_channel = self.get_channel(self.log_channel_id) or await self.fetch_channel(self.log_channel_id)
             except Exception as e:
                 log.error("cannot open channel %s: %s", self.channel_id, e)
             if not self.gpt.alive():
@@ -1194,16 +1213,23 @@ def make_bridge(cfg: dict, state: dict):
                 return
             try:
                 n, pending = 0, False
-                async for msg in self.channel.history(limit=100, after=discord.Object(id=int(last_id)), oldest_first=True):
+                msgs = []
+                for ch in (self.channel, self.log_channel):
+                    if ch is not None:
+                        msgs += [m async for m in ch.history(limit=100, after=discord.Object(id=int(last_id)), oldest_first=True)]
+                msgs.sort(key=lambda m: m.id)
+                for msg in msgs:
                     if msg.author.id == self.user.id or (msg.author.bot and msg.author.id != self.claude_id):
                         continue
                     if not msg.author.bot and msg.author.id not in self.humans():
                         continue
                     if (msg.content or "").strip().lower().startswith("!gpt"):
                         continue
-                    self.remember("Claude" if msg.author.bot else self.speaker(msg), self.clean(msg), msg.attachments)
+                    self.remember(self.tag("Claude" if msg.author.bot else self.speaker(msg), msg), self.clean(msg), msg.attachments)
                     n += 1
-                    pending = pending or await self.addressed_to_gpt(msg)
+                    if await self.addressed_to_gpt(msg):
+                        pending = True
+                        self.target_for(msg)
                 log.info("catch-up: %d messages since the last reply; addressed to GPT: %s", n, pending)
                 if pending:
                     self.streak, self.capped = 0, False
@@ -1227,9 +1253,10 @@ def make_bridge(cfg: dict, state: dict):
                 if now - self.last_claude_at > 5:  # chunks of one Claude reply count once
                     self.streak += 1
                 self.last_claude_at = now
-                self.remember("Claude", self.clean(msg), msg.attachments)
+                self.remember(self.tag("Claude", msg), self.clean(msg), msg.attachments)
                 if await self.addressed_to_gpt(msg):
-                    log.info("claude -> gpt (streak=%d)", self.streak)
+                    log.info("claude -> gpt (streak=%d)%s", self.streak, " [log]" if self.is_log(msg) else "")
+                    self.target_for(msg)
                     self.request_gpt()
                 return
             if msg.author.id not in self.humans():
@@ -1246,9 +1273,10 @@ def make_bridge(cfg: dict, state: dict):
             if content.lower().startswith("!gpt"):
                 await self.command(content[4:].strip())
                 return
-            self.remember(self.speaker(msg), self.clean(msg), msg.attachments)
+            self.remember(self.tag(self.speaker(msg), msg), self.clean(msg), msg.attachments)
             if await self.addressed_to_gpt(msg):
                 log.info("human -> gpt")
+                self.target_for(msg)
                 self.request_gpt()
 
         async def command(self, arg: str) -> None:
@@ -1298,7 +1326,7 @@ def make_bridge(cfg: dict, state: dict):
         async def rollover(self, handoff: bool, reason: str) -> None:
             """New chat in the same project, seeded with the intro and (optionally) a handoff
             summary written by the old chat. Call with page_lock held."""
-            await self.note(S("rollover_start", reason=reason, handoff=S("with_handoff") if handoff else ""))
+            await self.note(S("rollover_start", reason=reason, handoff=S("with_handoff") if handoff else ""), log_channel=True)
             summary = ""
             if handoff:
                 try:
@@ -1314,7 +1342,7 @@ def make_bridge(cfg: dict, state: dict):
             self.state.update(intro_sent=True, intro_version=int(self.cfg.get("intro_version", 1)),
                               turns_in_chat=0, last_turn_key=self.gpt.last_key)
             save_json(STATE_FILE, self.state)
-            await self.note(S("rollover_done", url=url))
+            await self.note(S("rollover_done", url=url), log_channel=True)
 
         async def mirror_watch(self) -> None:
             """Post turns the user typed in ChatGPT itself (not through Discord) to the channel."""
@@ -1358,7 +1386,7 @@ def make_bridge(cfg: dict, state: dict):
         async def control(self, tag: str, text: str) -> None:
             """A bridge control message to Claude: posted by the GPT bot, starts with the gear emoji."""
             try:
-                await self.channel.send(f"\u2699\ufe0f {tag} <@{self.claude_id}> {text}",
+                await (self.log_channel or self.channel).send(f"\u2699\ufe0f {tag} <@{self.claude_id}> {text}",
                                         allowed_mentions=discord.AllowedMentions(users=[discord.Object(id=self.claude_id)]),
                                         suppress_embeds=True)
             except Exception as e:
@@ -1477,7 +1505,7 @@ def make_bridge(cfg: dict, state: dict):
         async def restart_claude(self) -> None:
             """Fresh Claude session on request: stop the old one, start a new one, hand over."""
             handoff = self.cw_work / "handoff.md"
-            await self.note(S("restart_start"))
+            await self.note(S("restart_start"), log_channel=True)
             name = self.cw_name.replace("'", "''")
             ps = ("Get-CimInstance Win32_Process | Where-Object { $_.Name -eq 'claude.exe' -and $_.CommandLine -match '--channels' "
                   f"-and $_.CommandLine -match [regex]::Escape('{name}') }} | ForEach-Object {{ Stop-Process -Id $_.ProcessId -Force }}; "
@@ -1504,6 +1532,7 @@ def make_bridge(cfg: dict, state: dict):
                 if not batch:
                     continue
                 prompt = batch
+                target, self.reply_target = self.reply_target or self.channel, None
                 self.busy = True
                 try:
                     if self.channel is None:
@@ -1525,7 +1554,7 @@ def make_bridge(cfg: dict, state: dict):
                     self.state.update(intro_sent=True, intro_version=version, last_turn_key=self.gpt.last_key,
                                       turns_in_chat=int(self.state.get("turns_in_chat", 0)) + 1)
                     save_json(STATE_FILE, self.state)
-                    await self.post_reply(text, finished, outputs)
+                    await self.post_reply(text, finished, outputs, target)
                 except NeedsHuman as e:
                     log.warning("needs human: %s", e)
                     self.requeue(batch, atts)
@@ -1533,6 +1562,7 @@ def make_bridge(cfg: dict, state: dict):
                 except Exception as e:
                     # Never drop the batch: put it back, then retry (or roll over to a new chat).
                     self.requeue(batch, atts)
+                    self.reply_target = self.reply_target or target
                     self.failures += 1
                     tries = self.failures
                     if isinstance(e, ReplyFailed):
@@ -1571,7 +1601,8 @@ def make_bridge(cfg: dict, state: dict):
             return S("too_big", limit=f"{self.file_limit() / 1048576:.0f}", files=", ".join(
                 f"{p.name} {p.stat().st_size / 1048576:.1f} MB" for p in paths))
 
-        async def post_reply(self, text: str, finished: bool, outputs: list[Path] = ()) -> None:
+        async def post_reply(self, text: str, finished: bool, outputs: list[Path] = (), channel=None) -> None:
+            channel = channel or self.channel
             text = re.sub(r"@(?:bot)?claude\b", f"<@{self.claude_id}>", text, flags=re.I)
             text = fence_tables(text)
             text = text.replace("\u2699\ufe0f", "").replace("\u2699", "")  # only the bridge writes control messages
@@ -1597,17 +1628,17 @@ def make_bridge(cfg: dict, state: dict):
                         chunk = files[j:j + 10]
                         head = part if j == 0 else None
                         try:
-                            sent = await self.channel.send(head, files=[discord.File(str(p), filename=p.name) for p in chunk],
+                            sent = await channel.send(head, files=[discord.File(str(p), filename=p.name) for p in chunk],
                                                            suppress_embeds=True)
                             first_msg = first_msg or sent
                         except discord.HTTPException as e:
                             if e.status != 413:
                                 raise
                             log.warning("upload rejected as too large: %s", [p.name for p in chunk])
-                            await self.channel.send(((head + "\n\n") if head else "") + self.too_big_text(chunk),
+                            await channel.send(((head + "\n\n") if head else "") + self.too_big_text(chunk),
                                                     suppress_embeds=True)
                 else:
-                    sent = await self.channel.send(part, suppress_embeds=True)
+                    sent = await channel.send(part, suppress_embeds=True)
                     first_msg = first_msg or sent
             if first_msg is not None:
                 self.state["last_reply_msg_id"] = str(first_msg.id)
