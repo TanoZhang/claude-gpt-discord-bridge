@@ -106,9 +106,118 @@ if (isPluginServer && (ALLOW.length > 0 || SKIP_TO.length > 0)) {
 // (Allow / Deny buttons) in that channel, mentioning the user, instead of a DM to each
 // allowlisted user. The plugin's own button handler still checks that whoever clicks is
 // in access.json allowFrom, so other members and bots cannot approve.
+//
+// The plugin's prompt only names the tool ("🔐 Permission: Read"). Claude Code sends the
+// details with the request (the tool input and a reason) as an MCP notification on stdin.
+// A second 'data' listener, added right after the MCP transport's own, reads those lines
+// (the transport still gets every byte), so the channel post says exactly what Claude wants
+// to do: which file, which command, which URL. Without details the post stays as it was.
 import { createRequire } from 'node:module' // hoisted: loads before the plugin code runs
+import { StringDecoder } from 'node:string_decoder'
 const PERM_CHANNEL = process.env.DISCORD_PERMISSION_CHANNEL_ID
+
+// Wording of the channel post.
+const PERM_T = {
+  head: (what, tool) => `🔐 **Claude wants to ${what}** (${tool})`,
+  useTool: (name) => `use the tool ${name}`,
+  purpose: (s) => `Purpose: ${s}`,
+  chars: (n) => ` (${n} chars)`,
+  edits: (n) => ` (${n} edits, showing the first)`,
+  actions: {
+    Read: 'read a file', Write: 'write a file', Edit: 'edit a file', MultiEdit: 'edit a file', NotebookEdit: 'edit a notebook',
+    Bash: 'run a command', PowerShell: 'run a command', WebFetch: 'open a web page', WebSearch: 'search the web',
+    Glob: 'find files', Grep: 'search file contents', Agent: 'start a subagent', Task: 'start a subagent', Skill: 'use a skill',
+  },
+}
+
+const clip = (s, n) => { s = String(s ?? ''); return s.length > n ? s.slice(0, n) + '…' : s }
+const fence = (s, lang = '') => '```' + lang + '\n' + String(s).replace(/```/g, '`​``') + '\n```'
+const inline = (s) => '`' + String(s).replace(/`/g, "'") + '`'
+const MAIN_KEYS = ['command', 'file_path', 'notebook_path', 'url', 'query', 'pattern', 'path', 'skill', 'prompt']
+
+// Returns { text, cut } for the channel post, or null when there is nothing to add.
+function describePermission(d) {
+  const tool = String(d.tool_name ?? '')
+  const mcp = /^mcp__(.+?)__(.+)$/.exec(tool)
+  const lines = [PERM_T.head(PERM_T.actions[tool] ?? PERM_T.useTool(mcp ? mcp[2] : tool), tool)]
+  let input = null
+  try { const v = JSON.parse(d.input_preview); if (v && typeof v === 'object' && !Array.isArray(v)) input = v } catch {}
+  let cut = false
+  if (input) {
+    if ((tool === 'Bash' || tool === 'PowerShell') && typeof input.command === 'string') {
+      if (input.description) lines.push(PERM_T.purpose(clip(input.description, 200)))
+      lines.push(fence(clip(input.command, 900), tool === 'PowerShell' ? 'powershell' : 'bash'))
+      cut = input.command.length > 900
+    } else if ((tool === 'Edit' || tool === 'MultiEdit') && typeof input.file_path === 'string') {
+      const edits = Array.isArray(input.edits) ? input.edits : [input]
+      lines.push(inline(clip(input.file_path, 300)) + (edits.length > 1 ? PERM_T.edits(edits.length) : ''))
+      const e = edits[0] ?? {}
+      const side = (s, mark) => clip(s, 400).split('\n').map((l) => mark + l).join('\n')
+      if (typeof e.old_string === 'string' || typeof e.new_string === 'string') {
+        lines.push(fence(side(e.old_string ?? '', '- ') + '\n' + side(e.new_string ?? '', '+ '), 'diff'))
+        cut = String(e.old_string ?? '').length > 400 || String(e.new_string ?? '').length > 400 || edits.length > 1
+      }
+    } else if (tool === 'Write' && typeof input.file_path === 'string') {
+      const body = String(input.content ?? '')
+      lines.push(inline(clip(input.file_path, 300)) + PERM_T.chars(body.length))
+      if (body) lines.push(fence(clip(body, 300)))
+      cut = body.length > 300
+    } else {
+      const key = MAIN_KEYS.find((k) => typeof input[k] === 'string')
+      if (key) lines.push(key === 'prompt' ? clip(input[key], 300) : inline(clip(input[key], 300)))
+      const rest = Object.fromEntries(Object.entries(input).filter(([k]) => k !== key))
+      if (Object.keys(rest).length) {
+        const j = JSON.stringify(rest)
+        lines.push(fence(clip(j, 500), 'json'))
+        cut = j.length > 500
+      }
+    }
+  } else if (d.input_preview) {
+    lines.push(fence(clip(d.input_preview, 900)))
+    cut = String(d.input_preview).length > 900
+  }
+  const why = String(d.description ?? '').trim()
+  if (why && why !== tool) lines.push('> ' + clip(why, 300).replace(/\n/g, ' '))
+  let text = lines.join('\n')
+  if (text.length > 1800) { text = lines[0] + '\n' + fence(clip(d.input_preview, 1200)); cut = true }
+  return { text, cut }
+}
+
 if (isPluginServer && PERM_CHANNEL) {
+  const details = new Map() // request_id -> { tool_name, description, input_preview }
+  try {
+    const stdin = process.stdin
+    const origOn = stdin.on
+    const decoder = new StringDecoder('utf8')
+    let buf = ''
+    let attached = false
+    const sniff = (chunk) => {
+      buf += typeof chunk === 'string' ? chunk : decoder.write(chunk)
+      let nl
+      while ((nl = buf.indexOf('\n')) >= 0) {
+        const line = buf.slice(0, nl)
+        buf = buf.slice(nl + 1)
+        if (!line.includes('channel/permission_request')) continue
+        try {
+          const m = JSON.parse(line)
+          const p = m?.params
+          if (m?.method === 'notifications/claude/channel/permission_request' && p?.request_id) {
+            details.set(p.request_id, p)
+            if (details.size > 100) details.delete(details.keys().next().value)
+          }
+        } catch {}
+      }
+      if (buf.length > 8e6) buf = '' // a huge unfinished line is never a permission request
+    }
+    stdin.on = function (event, listener) {
+      const r = origOn.call(this, event, listener)
+      if (event === 'data' && !attached) { attached = true; origOn.call(this, 'data', sniff) }
+      return r
+    }
+  } catch (e) {
+    log(`permission details sniffer failed: ${e}`)
+  }
+
   try {
     const { User } = createRequire(process.argv[1])('discord.js')
     const origSend = User.prototype.send
@@ -118,13 +227,26 @@ if (isPluginServer && PERM_CHANNEL) {
       if (typeof content !== 'string' || !content.startsWith('🔐 Permission:') || !options?.components?.length) {
         return origSend.call(this, options)
       }
-      const key = JSON.stringify(options.components.map((c) => (typeof c.toJSON === 'function' ? c.toJSON() : c)))
+      const rows = options.components.map((c) => (typeof c.toJSON === 'function' ? c.toJSON() : c))
+      const key = JSON.stringify(rows)
       if (posted.has(key)) return null
       posted.add(key)
       if (posted.size > 200) posted.delete(posted.values().next().value)
+      const id = rows.flatMap((r) => r.components ?? [])
+        .map((b) => /^perm:(?:allow|deny|more):([a-km-z]{5})$/.exec(b.custom_id ?? '')?.[1]).find(Boolean)
+      for (let i = 0; id && !details.has(id) && i < 10; i++) await new Promise((r) => setTimeout(r, 30))
+      let text = content
+      let components = options.components
+      let info = null
+      try { info = id && details.has(id) ? describePermission(details.get(id)) : null } catch (e) { log(`permission details failed: ${e}`) }
+      if (info) {
+        text = info.text
+        // the details are in the post now; keep "See more" only when something was cut
+        if (!info.cut) components = rows.map((r) => ({ ...r, components: (r.components ?? []).filter((b) => !String(b.custom_id ?? '').startsWith('perm:more:')) }))
+      }
       const ch = await this.client.channels.fetch(PERM_CHANNEL)
-      log(`permission prompt -> channel ${PERM_CHANNEL}`)
-      return ch.send({ ...options, content: `<@${this.id}> ${content}`, allowedMentions: { users: [this.id] } })
+      log(`permission prompt -> channel ${PERM_CHANNEL} (details=${info ? 'yes' : 'no'})`)
+      return ch.send({ ...options, content: `<@${this.id}> ${text}`, components, allowedMentions: { users: [this.id] } })
     }
     log(`permission prompts go to channel ${PERM_CHANNEL}`)
   } catch (e) {

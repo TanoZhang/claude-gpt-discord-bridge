@@ -50,7 +50,7 @@ So the design goals became:
 - **Reports from your other sessions**: any other Claude Code session can drop a finished report into `data/reports/<name>.md`. The bridge posts it to the log channel and mentions Claude. Claude reads the full file and tells you in plain words what it means and what needs your decision. You no longer have to copy reports between sessions by hand.
 - **Pause button**: `!halt` makes GPT stop answering and tells Claude to stop after its current step; `!resume` picks up where they left off. Nothing is killed.
 - **Claude watch (zero tokens)**: the bridge reads Claude's session transcript. When Claude hits its usage limit, the bridge posts when it resets and tells Claude to continue at that time. When Claude's context grows past `claude_watch.ctx_limit`, the bridge asks it to write a handoff and request a fresh session. The bridge then restarts it, and the new session reads the handoff. Long sessions stop wasting quota.
-- **Permission prompts**: Claude's tool approvals arrive as Allow/Deny buttons, either in the channel (`permissions_in_channel`) or in your DMs. Only allowlisted humans can press them; GPT cannot approve anything.
+- **Permission prompts**: Claude's tool approvals arrive as Allow/Deny buttons, either in the channel (`permissions_in_channel`) or in your DMs. In the channel the prompt says what exactly Claude wants to do (the file, the command, the diff, the URL), not just the tool name. Only allowlisted humans can press them; GPT cannot approve anything.
 
 ## How it works
 
@@ -63,7 +63,7 @@ The official plugin (`discord@claude-plugins-official`) ignores every message fr
 - lets through only bot IDs listed in `DISCORD_ALLOW_BOT_IDS`, and only when they @mention Claude, so Claude is not billed for every GPT message;
 - drops any bot message shaped like a permission reply (`yes abcde`), so a bot can never approve a tool call;
 - optionally skips human messages addressed only to GPT (`DISCORD_SKIP_HUMAN_TO_BOT_IDS`);
-- optionally posts permission prompts in a channel instead of DMs (`DISCORD_PERMISSION_CHANNEL_ID`): it wraps discord.js's `User.send` for messages carrying the plugin's permission buttons, and the plugin's own click handler still checks the allowlist;
+- optionally posts permission prompts in a channel instead of DMs (`DISCORD_PERMISSION_CHANNEL_ID`): it wraps discord.js's `User.send` for messages carrying the plugin's permission buttons, and the plugin's own click handler still checks the allowlist. The plugin's prompt names only the tool, so the patch also reads the request details Claude Code sends on the plugin's stdin (a second listener; the MCP transport still gets every byte) and writes them into the post;
 - still goes through the plugin's own `access.json` gate afterwards.
 
 (Bun gives discord.js's client its own instance-level `emit`, so the patch wraps listeners at registration time rather than patching `emit`.)
