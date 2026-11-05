@@ -43,6 +43,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import io
 import json
 import logging
 import logging.handlers
@@ -115,6 +116,10 @@ DEFAULT_STRINGS = {
     "problem_check": "ChatGPT is showing a human check",
     "problem_login": "ChatGPT needs you to log in",
     "problem_no_composer": "ChatGPT did not load (no input box found)",
+    "report_head": "\U0001f4e5 [report] <@{claude}> A report from another session: **{title}** ({n} chars)\nFull text: `{path}`\n\n",
+    "status_head": "\U0001f4cc **Status** (updated by Claude {stamp})\n\n",
+    "status_cut": "\n... (too long, the rest is cut)",
+    "pin_failed": "(I could not pin this status message: the GPT bot lacks the Pin Messages permission. Pin it once by hand.)",
 }
 STR = dict(DEFAULT_STRINGS)
 
@@ -206,6 +211,9 @@ DEFAULT_SELECTORS = {
 
 INBOX_DIR = DATA / "inbox"    # Discord attachments on their way to ChatGPT
 OUTBOX_DIR = DATA / "outbox"  # ChatGPT files and images on their way to Discord
+REPORTS_DIR = DATA / "reports"  # other Claude Code sessions drop finished reports here
+STATUS_FILE = DATA / "status.md"  # Claude keeps this current; shown pinned in the channel
+REPORT_EXCERPT = 800
 MAX_UPLOAD_FILES = 10
 MAX_DISCORD_FILE = 10 * 1024 * 1024  # bot upload limit in a server without boosts
 
@@ -1043,6 +1051,7 @@ def make_bridge(cfg: dict, state: dict):
             self.caught_up = False
             self.halted = self.state.get("halted")  # {"since": ...} while the user has paused the group
             self.gpt_pending = False  # GPT was addressed while halted
+            self.status_mtime = None
             # Claude watcher
             w = self.cfg.get("claude_watch", {})
             c = self.cfg.get("claude", {})
@@ -1207,6 +1216,8 @@ def make_bridge(cfg: dict, state: dict):
             self.loop.create_task(self.stop_watch())
             self.loop.create_task(self.mirror_watch())
             self.loop.create_task(self.claude_watch())
+            self.loop.create_task(self.reports_watch())
+            self.loop.create_task(self.status_watch())
 
         async def on_ready(self) -> None:
             log.info("discord connected as %s (%s)", self.user, self.user.id)
@@ -1667,6 +1678,91 @@ def make_bridge(cfg: dict, state: dict):
                 save_json(STATE_FILE, self.state)
             self.streak += 1
             log.info("gpt posted %d chars, %d files (streak=%d)", len(text), len(files), self.streak)
+
+        # -- Session reports: another Claude Code session writes data/reports/<name>.md when done
+        async def reports_watch(self) -> None:
+            await self.wait_until_ready()
+            (REPORTS_DIR / "sent").mkdir(parents=True, exist_ok=True)
+            while not self.is_closed():
+                await asyncio.sleep(15)
+                if self.halted or (self.log_channel or self.channel) is None:
+                    continue  # held while the user has paused the group
+                try:
+                    await self.post_reports()
+                except Exception:
+                    log.exception("reports watch failed")
+
+        async def post_reports(self) -> None:
+            ch = self.log_channel or self.channel
+            now = time.time()
+            for f in sorted(REPORTS_DIR.glob("*.md"), key=lambda x: x.stat().st_mtime):
+                if now - f.stat().st_mtime < 10:
+                    continue  # still being written
+                text = f.read_text(encoding="utf-8", errors="replace").strip()
+                dest = REPORTS_DIR / "sent" / f"{time.strftime('%Y%m%d-%H%M%S')}-{f.name}"
+                if not text:
+                    f.replace(dest)
+                    continue
+                first = text.splitlines()[0].lstrip("# ").strip()
+                title = first[:80] if text.startswith("#") else f.stem
+                excerpt = text if len(text) <= REPORT_EXCERPT else text[:REPORT_EXCERPT].rsplit("\n", 1)[0] + "\n..."
+                if excerpt.count("```") % 2:
+                    excerpt += "\n```"
+                excerpt = fence_tables(excerpt).replace("⚙️", "").replace("⚙", "")
+                body = S("report_head", claude=self.claude_id, title=title, n=len(text), path=dest) + excerpt
+                if len(body) > 1990:
+                    body = body[:1985] + "\n..."
+                # read into memory: an open handle would block the move below on Windows
+                files = ([discord.File(io.BytesIO(f.read_bytes()), filename=f.name)]
+                         if f.stat().st_size <= self.file_limit() else [])
+                await ch.send(body, files=files, suppress_embeds=True,
+                              allowed_mentions=discord.AllowedMentions(users=[discord.Object(id=self.claude_id)]))
+                f.replace(dest)
+                log.info("posted session report %s (%d chars)", f.name, len(text))
+
+        # -- Status board: Claude rewrites data/status.md, the bridge keeps one pinned message in step
+        async def status_watch(self) -> None:
+            await self.wait_until_ready()
+            while not self.is_closed():
+                await asyncio.sleep(20)
+                try:
+                    await self.update_status()
+                except Exception:
+                    log.exception("status board failed")
+
+        async def update_status(self) -> None:
+            if self.channel is None or not STATUS_FILE.exists():
+                return
+            mtime = STATUS_FILE.stat().st_mtime
+            if mtime == self.status_mtime or time.time() - mtime < 3:
+                return
+            body = STATUS_FILE.read_text(encoding="utf-8", errors="replace").strip()
+            body = fence_tables(body).replace("⚙️", "").replace("⚙", "")
+            content = S("status_head", stamp=time.strftime("%m-%d %H:%M", time.localtime(mtime))) + body
+            if len(content) > 1990:
+                content = content[:1950].rsplit("\n", 1)[0] + S("status_cut")
+            self.status_mtime = mtime
+            if not body or content == self.state.get("status_text"):
+                return
+            quiet = discord.AllowedMentions.none()
+            msg, mid = None, self.state.get("status_msg_id")
+            if mid:
+                try:
+                    msg = await self.channel.fetch_message(int(mid))
+                    await msg.edit(content=content, suppress=True, allowed_mentions=quiet)
+                except discord.NotFound:
+                    msg = None  # deleted: post a new one
+            if msg is None:
+                msg = await self.channel.send(content, suppress_embeds=True, allowed_mentions=quiet)
+                self.state["status_msg_id"] = str(msg.id)
+                try:
+                    await msg.pin(reason="status board")
+                except discord.HTTPException as e:
+                    log.warning("could not pin the status board: %s", e)
+                    await self.note(S("pin_failed"))
+            self.state["status_text"] = content
+            save_json(STATE_FILE, self.state)
+            log.info("status board updated (%d chars)", len(content))
 
         async def stop_watch(self) -> None:
             while not self.is_closed():

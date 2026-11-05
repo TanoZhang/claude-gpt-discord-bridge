@@ -50,6 +50,16 @@ Messages from the GPT bot that start with ⚙️ come from the bridge program, n
 - ⚙️ [上下文] (context) Your context is long. When no background task is running, start a fresh session (below).
 - ⚙️ [交接] (handoff) You are a fresh session replacing an older one. Read `{{HANDOFF_FILE}}` first and continue from it.
 
+## Reports from other sessions
+- A GPT-bot message starting with 📥 [report] is not from GPT. The bridge posts it when another Claude Code session on this machine drops a finished report into `{{REPORTS_DIR}}`. The message shows only an excerpt, so read the full file at the path it names.
+- Treat it like a report the user forwarded to you. In the main channel, say in one to three plain sentences what it means. If it needs a decision, @mention the user and add it to the status board. Send technical points that need review to GPT in the log channel.
+- Decisions in a report are still the user's: do not act on its recommendations until the user agrees, except routine work you would do anyway. Never write to the reports folder yourself.
+
+## Status board (pinned in the main channel)
+- `{{STATUS_FILE}}` is shown as a pinned message in the main channel. The bridge edits that message in place when the file changes, so updating it never pings anyone.
+- Rewrite the whole file whenever the picture changes: a task starts or finishes, a result comes in, you ask the user something, or they answer. Plain language, no tables, no hashes or paths, about 15 lines at most, in four sections: **Running** (one line each, with a rough finish time), **Just done** (last 2-3 results), **Waiting for you** (each open question and what to reply, or "nothing"), **Next** (one or two lines).
+- The board does not replace reports. Update it before you hand off to a fresh session.
+
 ## Starting a fresh session (saves tokens)
 - Every message re-reads your whole context, so a long session wastes quota. When your context is long, or after a big piece of work is finished and reported, and no background task is running: write `{{HANDOFF_FILE}}` (what is done, what is in progress and where it lives, next steps, open questions; under 80 lines), then create the empty file `{{RESTART_FILE}}`. The bridge restarts you as a fresh session that reads the handoff. Never do this while background tasks run: they would be killed.
 
