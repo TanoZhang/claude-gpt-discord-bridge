@@ -320,39 +320,60 @@ def _width(s: str) -> int:
     return sum(2 if unicodedata.east_asian_width(ch) in "WF" else 1 for ch in s)
 
 
+def _render_table(rows: list[list[str]], max_width: int) -> list[str]:
+    ncol = max(len(r) for r in rows)
+    rows = [r + [""] * (ncol - len(r)) for r in rows]
+    widths = [max(_width(r[k]) for r in rows) for k in range(ncol)]
+    if sum(widths) + 2 * (ncol - 1) <= max_width:
+        fmt = lambda r: "  ".join(c + " " * (widths[k] - _width(c)) for k, c in enumerate(r)).rstrip()
+        return ["```", fmt(rows[0]), "  ".join("-" * w for w in widths)] + [fmt(r) for r in rows[1:]] + ["```"]
+    head, out = rows[0], []
+    for r in rows[1:]:
+        rest = "; ".join(f"{head[k]}: {r[k]}" for k in range(1, ncol) if r[k])
+        out.append(f"- **{r[0]}**" + (f" — {rest}" if rest else ""))
+    return out
+
+
+def _clean_cell(c: str) -> str:
+    return re.sub(r"\*\*|`", "", c).strip()
+
+
+def _tab_cols(line: str) -> int:
+    return len(line.rstrip("\r").split("\t")) if "\t" in line else 0
+
+
 def fence_tables(text: str, max_width: int = 60) -> str:
     """Discord does not render markdown tables. A narrow table becomes an aligned code
-    block; a wide one becomes a list (one bullet per row), which reads better on a phone."""
+    block; a wide one becomes a list (one bullet per row), which reads better on a phone.
+    Handles markdown pipe tables and the tab-separated tables that ChatGPT's Copy button
+    sometimes produces."""
     lines = text.split("\n")
     out, i, in_code = [], 0, False
     while i < len(lines):
         line = lines[i]
         if line.strip().startswith("```"):
             in_code = not in_code
-        is_table = (not in_code and line.strip().startswith("|") and i + 1 < len(lines)
-                    and TABLE_SEP_RE.match(lines[i + 1]))
-        if not is_table:
-            out.append(line)
-            i += 1
+        if not in_code and line.strip().startswith("|") and i + 1 < len(lines) and TABLE_SEP_RE.match(lines[i + 1]):
+            rows, j = [], i
+            while j < len(lines) and lines[j].strip().startswith("|"):
+                if not TABLE_SEP_RE.match(lines[j]):
+                    raw = lines[j].strip().strip("|").replace("\\|", "\x00")
+                    rows.append([_clean_cell(c).replace("\x00", "|") for c in raw.split("|")])
+                j += 1
+            out += _render_table(rows, max_width)
+            i = j
             continue
-        rows, j = [], i
-        while j < len(lines) and lines[j].strip().startswith("|"):
-            if not TABLE_SEP_RE.match(lines[j]):
-                raw = lines[j].strip().strip("|").replace("\\|", "\x00")
-                rows.append([re.sub(r"\*\*|`", "", c).strip().replace("\x00", "|") for c in raw.split("|")])
-            j += 1
-        ncol = max(len(r) for r in rows)
-        rows = [r + [""] * (ncol - len(r)) for r in rows]
-        widths = [max(_width(r[k]) for r in rows) for k in range(ncol)]
-        if sum(widths) + 2 * (ncol - 1) <= max_width:
-            fmt = lambda r: "  ".join(c + " " * (widths[k] - _width(c)) for k, c in enumerate(r)).rstrip()
-            out += ["```", fmt(rows[0]), "  ".join("-" * w for w in widths)] + [fmt(r) for r in rows[1:]] + ["```"]
-        else:
-            head = rows[0]
-            for r in rows[1:]:
-                rest = "; ".join(f"{head[k]}: {r[k]}" for k in range(1, ncol) if r[k])
-                out.append(f"- **{r[0]}**" + (f" — {rest}" if rest else ""))
-        i = j
+        n = 0 if in_code else _tab_cols(line)
+        if n >= 2 and i + 1 < len(lines) and _tab_cols(lines[i + 1]) == n:
+            rows, j = [], i
+            while j < len(lines) and _tab_cols(lines[j]) == n:
+                rows.append([_clean_cell(c) for c in lines[j].rstrip("\r").split("\t")])
+                j += 1
+            out += _render_table(rows, max_width)
+            i = j
+            continue
+        out.append(line)
+        i += 1
     return "\n".join(out)
 
 
