@@ -45,6 +45,8 @@ So the design goals became:
 - **Web mirror**: if you type into ChatGPT directly, the bridge notices within a minute and posts your question and the answer to the channel.
 - **Handoff**: `!gpt new` asks the old chat for a handoff summary, then opens a fresh chat in the same ChatGPT project, seeded with the summary. This also happens automatically every `rollover_turns` turns.
 - **Nothing gets dropped**: if ChatGPT errors out or takes your message back, the batch is requeued and retried after a reload, merged with anything said in the meantime. If ChatGPT says the chat is too long, the bridge rolls over to a new chat and resends.
+- **Pause button**: `!halt` makes GPT stop answering and tells Claude to stop after its current step; `!resume` picks up where they left off. Nothing is killed.
+- **Claude watch (zero tokens)**: the bridge reads Claude's session transcript. When Claude hits its usage limit, the bridge posts when it resets and tells Claude to continue at that time. When Claude's context grows past `claude_watch.ctx_limit`, the bridge asks it to write a handoff and request a fresh session. The bridge then restarts it, and the new session reads the handoff. Long sessions stop wasting quota.
 - **Permission prompts**: Claude's tool approvals arrive as Allow/Deny buttons, either in the channel (`permissions_in_channel`) or in your DMs. Only allowlisted humans can press them; GPT cannot approve anything.
 
 ## How it works
@@ -117,6 +119,7 @@ The official plugin (`discord@claude-plugins-official`) ignores every message fr
 | `!gpt url <link>` | Switch to another ChatGPT conversation |
 | `!gpt cap <n>` | Change the loop cap |
 | `!gpt show` / `!gpt hide` | Show the browser to log in or pass a check, then hide it |
+| `!halt` / `!resume` | Pause the group (GPT quiet, Claude stops after its current step) / continue |
 
 Stop or restart: `scripts\stop.ps1 [-Restart]`. A restarted Claude session starts fresh; `scripts\launch-claude.ps1 -Resume <session-id>` continues an old one.
 
@@ -132,6 +135,7 @@ Stop or restart: `scripts\stop.ps1 [-Restart]`. A restarted Claude session start
 | `browser_mode` | `headless` | `headless` or `headed` |
 | `permissions_in_channel` | `true` | Claude's Allow/Deny buttons in the channel instead of DMs (takes effect when Claude restarts) |
 | `max_file_mb` | server limit | Cap for files posted to Discord |
+| `claude_watch.ctx_limit` | 150000 | Claude context (tokens) at which the bridge asks for a fresh session |
 | `intro` / `handoff_prompt` | English | What GPT is told about the group, and how it is asked for a summary |
 | `strings` | `{}` | Override or translate any message the bridge posts |
 | `selectors` | ChatGPT as of 2026-11 | Fix these when ChatGPT's markup changes |

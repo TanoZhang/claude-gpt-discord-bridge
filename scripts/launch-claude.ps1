@@ -17,6 +17,7 @@ $prompt   = Join-Path $data 'claude-prompt.md'
 $text = Get-Content $template -Raw -Encoding UTF8
 $text = $text.Replace('{{OWNER_ID}}', $cfg.owner_id).Replace('{{GPT_BOT_ID}}', $cfg.gpt_bot_id)
 $text = $text.Replace('{{CLAUDE_BOT_ID}}', $cfg.claude_bot_id).Replace('{{CHANNEL_ID}}', $cfg.channel_id)
+$text = $text.Replace('{{HANDOFF_FILE}}', (Join-Path $data 'handoff.md')).Replace('{{RESTART_FILE}}', (Join-Path $data 'restart.request'))
 Set-Content -Path $prompt -Value $text -Encoding UTF8
 
 $env:BUN_OPTIONS = '--preload=' + ((Join-Path $root 'plugin-patch\allow-bots.mjs') -replace '\\', '/')

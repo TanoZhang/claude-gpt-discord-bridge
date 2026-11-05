@@ -86,6 +86,22 @@ DEFAULT_STRINGS = {
     "reason_manual": "asked for",
     "reason_auto": "this chat reached {n} turns",
     "handoff_header": "[Handoff summary from the previous chat]",
+    "halt_already": "⏸️ Already paused. Send `!resume` to continue.",
+    "halt_claude": "The user paused the group: finish the step you are on, say where you stopped, start nothing new, do not message GPT. Running background tasks may finish; post their results after [继续].",
+    "halt_done": "⏸️ Paused: GPT stays quiet and Claude stops after its current step. Send `!resume` to continue.",
+    "resume_not_halted": "▶️ Nothing is paused.",
+    "resume_claude": "The user resumed the group: continue where you stopped, and say in one line what you continue with.",
+    "resume_done": "▶️ Resumed.",
+    "claude_limit": "⏸️ Claude hit its usage limit ({text}). Back around {when}; I will tell it to continue then. GPT keeps working meanwhile.",
+    "limit_over_claude": "Your usage limit should have reset: continue the work that was cut off. Check `git worktree list` and the latest channel messages first, and report when done.",
+    "ctx_claude": "Your context is about {k}k tokens. When no background task is running: write a handoff to `{handoff}` (what is done, what is in progress and where, next steps, questions for the user), then create the empty file `{restart}`. The bridge starts a fresh session that reads the handoff first.",
+    "restart_start": "♻️ Claude asked for a fresh session (saves tokens); restarting...",
+    "handoff_claude": "You are a fresh session replacing the previous Claude. Read `{handoff}` first, continue from it, and say in one line what you took over.",
+    "status_halted": "Group: ⏸️ paused by the user (`!resume` to continue)",
+    "status_running": "Group: ▶️ running",
+    "status_claude_limit": "; Claude: ⏸️ usage limit, back around {when}",
+    "status_claude_ctx": "; Claude context about {k}k tokens",
+    "recent_header": "[Your most recent replies in the previous chat (excerpts); carry on from here]",
     "rollover_done": "New chat: <{url}>",
     "mirror_header": "**(asked directly in ChatGPT)**",
     "attach_failed": "[these attachments could not be passed on: {names}]",
@@ -175,7 +191,7 @@ def load_config() -> dict:
 DEFAULT_SELECTORS = {
     "composer": "[data-chatgpt-composer] [contenteditable='true'][role='textbox']",
     "send": "[data-chatgpt-composer] button[type='submit']",
-    "stop": "[data-chatgpt-composer] button[aria-label^='Stop'], button[data-testid='stop-button']",
+    "stop": "[data-chatgpt-composer] button[aria-label^='Stop'], [data-chatgpt-composer] button[data-testid*='stop'], button[data-testid='stop-button']",
     "turn": "[data-turn-key]",
     "turn_state": "[data-talvt-turn-state]",
     "turn_done": "complete",
@@ -567,6 +583,35 @@ def squash(s: str) -> str:
     return re.sub(r"\s+", "", s or "")
 
 
+LIMIT_RE = re.compile(r"hit your (session |5-hour |weekly )?limit|usage limit|limit reached|out of (extra )?usage", re.I)
+RESET_RE = re.compile(r"resets\s+(?:at\s+)?(\d{1,2})(?::(\d{2}))?\s*(am|pm)?(?:\s*\(([^)]+)\))?", re.I)
+
+
+def parse_reset(text: str) -> float | None:
+    """'... resets 2:50am (America/Los_Angeles)' -> next such moment, as a unix time."""
+    import datetime as dt
+
+    m = RESET_RE.search(text or "")
+    if not m:
+        return None
+    hour, minute, ampm, zone = int(m.group(1)), int(m.group(2) or 0), (m.group(3) or "").lower(), m.group(4)
+    if ampm == "pm" and hour != 12:
+        hour += 12
+    if ampm == "am" and hour == 12:
+        hour = 0
+    try:
+        from zoneinfo import ZoneInfo
+
+        tz = ZoneInfo(zone) if zone else None
+    except Exception:
+        tz = None
+    now = dt.datetime.now(tz) if tz else dt.datetime.now()
+    at = now.replace(hour=hour % 24, minute=minute, second=0, microsecond=0)
+    if at <= now:
+        at += dt.timedelta(days=1)
+    return at.timestamp()
+
+
 class ReplyFailed(Exception):
     """ChatGPT did not answer our message: it showed an error, or the message vanished."""
 
@@ -575,8 +620,8 @@ class ReplyFailed(Exception):
         self.too_long = too_long
 
 
-ERROR_RE = re.compile(r"something went wrong|error (generating|occurred)|network error|try again|retry|出错|错误|重试|请稍后", re.I)
-TOO_LONG_RE = re.compile(r"too long|maximum (context|length)|context (window|length)|start a new chat|对话太长|过长|新对话", re.I)
+ERROR_RE = re.compile(r"something went wrong|unknown error|error (generating|occurred)|network error|try again|retry|出错|错误|重试|请稍后", re.I)
+TOO_LONG_RE = re.compile(r"too long|too large|maximum (context|length)|context (window|length)|start (a )?new chat|对话太长|过长|新对话", re.I)
 
 
 class NeedsHuman(Exception):
@@ -603,6 +648,7 @@ class ChatGPT:
         self.mode = cfg["browser_mode"]
         self.last_used = 0.0
         self.last_key: str | None = None  # last turn the bridge itself produced
+        self.too_large = False  # ChatGPT answered our last send with 413 conversation_too_large
 
     @property
     def chat_url(self) -> str:
@@ -630,6 +676,7 @@ class ChatGPT:
         self.ctx = await self.pw.chromium.launch_persistent_context(**kw)
         await self.ctx.add_init_script(script=COPY_HOOK_JS)
         self.page = self.ctx.pages[0] if self.ctx.pages else await self.ctx.new_page()
+        self.page.on("response", self._on_response)
         if self.mode == "headless":
             ua = await self.page.evaluate("navigator.userAgent")
             if "HeadlessChrome" in ua:
@@ -640,6 +687,12 @@ class ChatGPT:
                 return
         log.info("browser started (%s)", self.mode)
         await self.open_chat()
+
+    def _on_response(self, resp) -> None:
+        # The chat is full: ChatGPT shows only "Unknown error / Start new chat".
+        if resp.status == 413 and "/conversation" in resp.url and resp.request.method == "POST":
+            self.too_large = True
+            log.warning("ChatGPT rejected the message: conversation too large (413)")
 
     async def close(self) -> None:
         if self.ctx is not None:
@@ -734,6 +787,7 @@ class ChatGPT:
         raise RuntimeError("file upload to ChatGPT did not finish")
 
     async def _send(self, text: str, files: list[Path] | None = None) -> str:
+        self.too_large = False
         before = await self.last_turn()
         box = self.page.locator(self.sel["composer"]).first
         await box.click()
@@ -777,6 +831,9 @@ class ChatGPT:
         prev, stable, empty_done, gone = None, 0, 0, 0
         while True:
             elapsed = time.monotonic() - start
+            if self.too_large:
+                await self.dump_turn("too-large")
+                raise ReplyFailed("conversation_too_large", too_long=True)
             turn = await self.last_turn()
             if snippet:
                 gone = gone + 1 if snippet not in squash(turn["userText"]) else 0
@@ -802,9 +859,10 @@ class ChatGPT:
                 if len(fb) < 500 and (ERROR_RE.search(fb) or TOO_LONG_RE.search(fb)):
                     await self.dump_turn("error")
                     raise ReplyFailed(fb[:300], too_long=bool(TOO_LONG_RE.search(fb)))
-                await self.dump_turn("unparsed")
-                log.warning("reply shape not parsed; sending its visible text (%d chars)", len(fb))
-                return fb, True
+                if len(fb) >= 40:  # shorter is a status line such as "Thinking"
+                    await self.dump_turn("unparsed")
+                    log.warning("reply shape not parsed; sending its visible text (%d chars)", len(fb))
+                    return fb, True
             if not has_output and not generating and elapsed > self.cfg["first_token_timeout_s"]:
                 if done_state:
                     await self.dump_turn("empty")
@@ -958,6 +1016,31 @@ def make_bridge(cfg: dict, state: dict):
             self.channel = None
             self.page_lock = asyncio.Lock()
             self.failures = 0  # failed tries of the current batch
+            self.caught_up = False
+            self.halted = self.state.get("halted")  # {"since": ...} while the user has paused the group
+            self.gpt_pending = False  # GPT was addressed while halted
+            # Claude watcher
+            w = self.cfg.get("claude_watch", {})
+            c = self.cfg.get("claude", {})
+            if c.get("workdir"):
+                w.setdefault("project_dir", str(Path.home() / ".claude" / "projects" / re.sub(r"[^A-Za-z0-9]", "-", c["workdir"])))
+            w.setdefault("session_name", c.get("name", "Group Claude"))
+            w.setdefault("work_dir", str(DATA))
+            w.setdefault("ensure_script", str(ROOT / "scripts" / "ensure.ps1"))
+            w.setdefault("lock_file", str(DATA / "ensure.lock"))
+            self.cw_dir = Path(os.path.expanduser(w["project_dir"])) if w.get("project_dir") else None
+            self.cw_name = w.get("session_name", "")
+            self.cw_ctx_limit = int(w.get("ctx_limit", 150000))
+            self.cw_work = Path(os.path.expanduser(w["work_dir"]))
+            self.cw_ensure = os.path.expanduser(w.get("ensure_script", ""))
+            self.cw_lock = os.path.expanduser(w.get("lock_file", ""))
+            self.cw_file: Path | None = None
+            self.cw_offset = 0
+            self.cw_known: dict[str, bool] = {}
+            self.cw_ctx = 0
+            self.cw_nudged_at = 0.0
+            self.cw_paused_until: float | None = None
+            self.cw_limit_text = ""
 
         # -- helpers
         @property
@@ -1067,6 +1150,9 @@ def make_bridge(cfg: dict, state: dict):
                 log.warning("note failed: %s", e)
 
         def request_gpt(self) -> None:
+            if self.halted:
+                self.gpt_pending = True  # answered after !resume
+                return
             if self.streak >= self.cap:
                 if not self.capped:
                     self.capped = True
@@ -1082,6 +1168,7 @@ def make_bridge(cfg: dict, state: dict):
             self.loop.create_task(self.worker())
             self.loop.create_task(self.stop_watch())
             self.loop.create_task(self.mirror_watch())
+            self.loop.create_task(self.claude_watch())
 
         async def on_ready(self) -> None:
             log.info("discord connected as %s (%s)", self.user, self.user.id)
@@ -1096,6 +1183,33 @@ def make_bridge(cfg: dict, state: dict):
                     log.warning("browser needs the user: %s", e)
                 except Exception:
                     log.exception("browser start failed")
+            if not self.caught_up:
+                self.caught_up = True
+                await self.catch_up()
+
+        async def catch_up(self) -> None:
+            """After a restart, re-queue everything said since GPT's last real reply."""
+            last_id = self.state.get("last_reply_msg_id")
+            if not last_id or self.channel is None:
+                return
+            try:
+                n, pending = 0, False
+                async for msg in self.channel.history(limit=100, after=discord.Object(id=int(last_id)), oldest_first=True):
+                    if msg.author.id == self.user.id or (msg.author.bot and msg.author.id != self.claude_id):
+                        continue
+                    if not msg.author.bot and msg.author.id not in self.humans():
+                        continue
+                    if (msg.content or "").strip().lower().startswith("!gpt"):
+                        continue
+                    self.remember("Claude" if msg.author.bot else self.speaker(msg), self.clean(msg), msg.attachments)
+                    n += 1
+                    pending = pending or await self.addressed_to_gpt(msg)
+                log.info("catch-up: %d messages since the last reply; addressed to GPT: %s", n, pending)
+                if pending:
+                    self.streak, self.capped = 0, False
+                    self.trigger.set()
+            except Exception:
+                log.exception("catch-up failed")
 
         async def on_message(self, msg) -> None:
             try:
@@ -1122,6 +1236,13 @@ def make_bridge(cfg: dict, state: dict):
                 return
             self.streak, self.capped = 0, False
             content = (msg.content or "").strip()
+            low = content.lower()
+            if low.startswith(("!halt", "!pause")):
+                await self.halt()
+                return
+            if low.startswith(("!resume", "!continue")):
+                await self.resume()
+                return
             if content.lower().startswith("!gpt"):
                 await self.command(content[4:].strip())
                 return
@@ -1138,7 +1259,10 @@ def make_bridge(cfg: dict, state: dict):
                 await self.note(
                     S("status", browser=S("up") if self.gpt.alive() else S("down"), mode=self.gpt.mode,
                       activity=S("replying") if self.busy else S("idle"), streak=self.streak, cap=self.cap,
-                      turns=self.state.get("turns_in_chat", 0), limit=f"/{limit}" if limit else "", url=self.gpt.chat_url))
+                      turns=self.state.get("turns_in_chat", 0), limit=f"/{limit}" if limit else "", url=self.gpt.chat_url)
+                    + "\n" + (S("status_halted") if self.halted else S("status_running"))
+                    + (S("status_claude_limit", when=time.strftime("%H:%M", time.localtime(self.cw_paused_until))) if self.cw_paused_until else "")
+                    + (S("status_claude_ctx", k=self.cw_ctx // 1000) if self.cw_ctx else ""))
             elif cmd == "cap" and len(parts) > 1 and parts[1].isdigit():
                 self.state["loop_cap"] = max(1, int(parts[1]))
                 save_json(STATE_FILE, self.state)
@@ -1177,7 +1301,12 @@ def make_bridge(cfg: dict, state: dict):
             await self.note(S("rollover_start", reason=reason, handoff=S("with_handoff") if handoff else ""))
             summary = ""
             if handoff:
-                summary, _, _ = await self.gpt.ask(self.cfg["handoff_prompt"], collect=False)
+                try:
+                    summary, _, _ = await self.gpt.ask(self.cfg["handoff_prompt"], collect=False)
+                except ReplyFailed as e:
+                    log.warning("handoff summary failed: %s", e)
+            if not summary.strip() and self.state.get("recent_replies"):
+                summary = S("recent_header") + "\n\n" + "\n\n---\n\n".join(self.state["recent_replies"])
             first = self.cfg["intro"]
             if summary.strip():
                 first += "\n\n" + S("handoff_header") + "\n" + summary.strip()
@@ -1225,6 +1354,144 @@ def make_bridge(cfg: dict, state: dict):
             await asyncio.sleep(delay)
             if self.buffer:
                 self.trigger.set()
+
+        async def control(self, tag: str, text: str) -> None:
+            """A bridge control message to Claude: posted by the GPT bot, starts with the gear emoji."""
+            try:
+                await self.channel.send(f"\u2699\ufe0f {tag} <@{self.claude_id}> {text}",
+                                        allowed_mentions=discord.AllowedMentions(users=[discord.Object(id=self.claude_id)]),
+                                        suppress_embeds=True)
+            except Exception as e:
+                log.warning("control message failed: %s", e)
+
+        async def halt(self) -> None:
+            if self.halted:
+                await self.note(S("halt_already"))
+                return
+            self.halted = {"since": time.time()}
+            self.state["halted"] = self.halted
+            save_json(STATE_FILE, self.state)
+            log.info("halted by the user")
+            await self.control("[暂停]", S("halt_claude"))
+            await self.note(S("halt_done"))
+
+        async def resume(self) -> None:
+            if not self.halted:
+                await self.note(S("resume_not_halted"))
+                return
+            self.halted = None
+            self.state.pop("halted", None)
+            save_json(STATE_FILE, self.state)
+            log.info("resumed by the user")
+            await self.control("[继续]", S("resume_claude"))
+            await self.note(S("resume_done"))
+            if self.gpt_pending:
+                self.gpt_pending = False
+                self.streak, self.capped = 0, False
+                self.trigger.set()
+
+        # -- Claude watcher: reads the Claude session's transcript (no tokens spent)
+        def _cw_find(self) -> Path | None:
+            if not self.cw_dir or not self.cw_dir.is_dir():
+                return None
+            marker = f'"customTitle":"{self.cw_name}"'
+            for f in sorted(self.cw_dir.glob("*.jsonl"), key=lambda x: x.stat().st_mtime, reverse=True)[:12]:
+                key = str(f)
+                if key not in self.cw_known:
+                    try:
+                        self.cw_known[key] = marker in f.read_text(encoding="utf-8", errors="replace")
+                    except Exception:
+                        self.cw_known[key] = False
+                if self.cw_known[key]:
+                    return f
+            return None
+
+        def _cw_read(self) -> list[dict]:
+            f = self._cw_find()
+            if f is None:
+                return []
+            if f != self.cw_file:  # a new session: start at its end, the past is not news
+                self.cw_file, self.cw_offset, self.cw_ctx = f, f.stat().st_size, 0
+                log.info("watching Claude transcript %s", f.name)
+                return []
+            size = f.stat().st_size
+            if size <= self.cw_offset:
+                return []
+            with open(f, "rb") as fh:
+                fh.seek(self.cw_offset)
+                chunk = fh.read(size - self.cw_offset)
+            last_nl = chunk.rfind(b"\n")
+            if last_nl < 0:
+                return []
+            self.cw_offset += last_nl + 1
+            out = []
+            for line in chunk[:last_nl].splitlines():
+                try:
+                    out.append(json.loads(line))
+                except Exception:
+                    pass
+            return out
+
+        async def claude_watch(self) -> None:
+            await self.wait_until_ready()
+            while not self.is_closed():
+                await asyncio.sleep(30)
+                try:
+                    await self.check_claude()
+                except Exception:
+                    log.exception("claude watch failed")
+
+        async def check_claude(self) -> None:
+            if self.channel is None:
+                return
+            req = self.cw_work / "restart.request"
+            if req.exists():
+                req.unlink(missing_ok=True)
+                await self.restart_claude()
+                return
+            for e in self._cw_read():
+                if e.get("type") != "assistant":
+                    continue
+                msg = e.get("message") or {}
+                usage = msg.get("usage") or {}
+                ctx = sum(int(usage.get(k) or 0) for k in ("input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens"))
+                if ctx:
+                    self.cw_ctx = ctx
+                text = " ".join(b.get("text", "") for b in msg.get("content") or [] if isinstance(b, dict))
+                if e.get("isApiErrorMessage") and LIMIT_RE.search(text) and self.cw_paused_until is None:
+                    self.cw_paused_until = parse_reset(text) or time.time() + 3600
+                    self.cw_limit_text = text.strip()[:200]
+                    when = time.strftime("%H:%M", time.localtime(self.cw_paused_until))
+                    log.warning("Claude hit its usage limit: %s", self.cw_limit_text)
+                    await self.note(S("claude_limit", text=self.cw_limit_text, when=when))
+            now = time.time()
+            if self.cw_paused_until and now >= self.cw_paused_until + 60:
+                self.cw_paused_until = None
+                await self.control("[额度恢复]", S("limit_over_claude"))
+            if (self.cw_ctx > self.cw_ctx_limit and now - self.cw_nudged_at > 7200
+                    and not self.halted and not self.cw_paused_until):
+                self.cw_nudged_at = now
+                handoff, restart = self.cw_work / "handoff.md", self.cw_work / "restart.request"
+                await self.control("[上下文]", S("ctx_claude", k=self.cw_ctx // 1000, handoff=handoff, restart=restart))
+
+        async def restart_claude(self) -> None:
+            """Fresh Claude session on request: stop the old one, start a new one, hand over."""
+            handoff = self.cw_work / "handoff.md"
+            await self.note(S("restart_start"))
+            name = self.cw_name.replace("'", "''")
+            ps = ("Get-CimInstance Win32_Process | Where-Object { $_.Name -eq 'claude.exe' -and $_.CommandLine -match '--channels' "
+                  f"-and $_.CommandLine -match [regex]::Escape('{name}') }} | ForEach-Object {{ Stop-Process -Id $_.ProcessId -Force }}; "
+                  "Start-Sleep -Seconds 3; ")
+            if self.cw_lock:
+                ps += f"Remove-Item '{self.cw_lock}' -ErrorAction SilentlyContinue; "
+            if self.cw_ensure:
+                ps += f"& '{self.cw_ensure}'"
+            proc = await asyncio.create_subprocess_exec("powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps)
+            await proc.wait()
+            self.cw_file, self.cw_ctx, self.cw_nudged_at = None, 0, time.time()
+            await asyncio.sleep(45)  # the new session needs a moment to connect to Discord
+            await self.control("[交接]", S("handoff_claude", handoff=handoff))
+            log.info("Claude restarted as a fresh session")
 
         async def worker(self) -> None:
             await self.wait_until_ready()
@@ -1307,6 +1574,7 @@ def make_bridge(cfg: dict, state: dict):
         async def post_reply(self, text: str, finished: bool, outputs: list[Path] = ()) -> None:
             text = re.sub(r"@(?:bot)?claude\b", f"<@{self.claude_id}>", text, flags=re.I)
             text = fence_tables(text)
+            text = text.replace("\u2699\ufe0f", "").replace("\u2699", "")  # only the bridge writes control messages
             text = re.sub(r"@(everyone|here)\b", "@​\\1", text)
             limit = self.file_limit()
             files = [p for p in outputs if p.stat().st_size <= limit]
@@ -1321,6 +1589,7 @@ def make_bridge(cfg: dict, state: dict):
             parts = split_message(text) or [""]
             if len(parts) > 1:  # numbered, so a reader who got only some parts knows to fetch the rest
                 parts = [f"{p}\n({i + 1}/{len(parts)})" for i, p in enumerate(parts)]
+            first_msg = None
             for i, part in enumerate(parts):
                 last = i == len(parts) - 1
                 if last and files:
@@ -1328,8 +1597,9 @@ def make_bridge(cfg: dict, state: dict):
                         chunk = files[j:j + 10]
                         head = part if j == 0 else None
                         try:
-                            await self.channel.send(head, files=[discord.File(str(p), filename=p.name) for p in chunk],
-                                                    suppress_embeds=True)
+                            sent = await self.channel.send(head, files=[discord.File(str(p), filename=p.name) for p in chunk],
+                                                           suppress_embeds=True)
+                            first_msg = first_msg or sent
                         except discord.HTTPException as e:
                             if e.status != 413:
                                 raise
@@ -1337,7 +1607,12 @@ def make_bridge(cfg: dict, state: dict):
                             await self.channel.send(((head + "\n\n") if head else "") + self.too_big_text(chunk),
                                                     suppress_embeds=True)
                 else:
-                    await self.channel.send(part, suppress_embeds=True)
+                    sent = await self.channel.send(part, suppress_embeds=True)
+                    first_msg = first_msg or sent
+            if first_msg is not None:
+                self.state["last_reply_msg_id"] = str(first_msg.id)
+                self.state["recent_replies"] = (self.state.get("recent_replies", []) + [text[:1500]])[-3:]
+                save_json(STATE_FILE, self.state)
             self.streak += 1
             log.info("gpt posted %d chars, %d files (streak=%d)", len(text), len(files), self.streak)
 
