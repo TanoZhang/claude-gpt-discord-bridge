@@ -177,7 +177,8 @@ function describePermission(d) {
     cut = String(d.input_preview).length > 900
   }
   const why = String(d.description ?? '').trim()
-  if (why && why !== tool) lines.push('> ' + clip(why, 300).replace(/\n/g, ' '))
+  // for the tools listed above the reason is only the tool's generic description; keep it for the others
+  if (why && why !== tool && !(tool in PERM_T.actions)) lines.push('> ' + clip(why, 300).replace(/\n/g, ' '))
   let text = lines.join('\n')
   if (text.length > 1800) { text = lines[0] + '\n' + fence(clip(d.input_preview, 1200)); cut = true }
   return { text, cut }

@@ -36,6 +36,7 @@ $cliArgs += @(
   '--permission-mode', $(if ($c.permission_mode) { $c.permission_mode } else { 'auto' }),
   '--model', $(if ($c.model) { $c.model } else { 'sonnet' }),
   '--name', $(if ($c.name) { $c.name } else { 'Group Claude' }),
+  '--add-dir', $data,  # handoff, status and restart files: no Allow click needed for them
   '--append-system-prompt-file', $prompt)
 
 Set-Location $c.workdir
