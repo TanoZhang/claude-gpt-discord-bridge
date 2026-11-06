@@ -105,6 +105,7 @@ DEFAULT_STRINGS = {
     "recent_header": "[Your most recent replies in the previous chat (excerpts); carry on from here]",
     "rollover_done": "New chat: <{url}>",
     "mirror_header": "**(asked directly in ChatGPT)**",
+    "followed_chat": "You moved to another chat in the ChatGPT project; the bridge follows you there and posts it here: <{url}>",
     "attach_failed": "[these attachments could not be passed on: {names}]",
     "needs_human_ask": "{problem}; the message is kept. Send `!gpt show` to open the browser window and `!gpt hide` when done: it is then sent again.",
     "retry_gave_up": "(GPT did not get these messages after {n} tries: {reason}. They stay queued and go out with the next @GPT.)",
@@ -509,8 +510,8 @@ TURNS_AFTER_JS = r"""
   const turns = Array.from(document.querySelectorAll(sel.turn));
   const stAttr = sel.turn_state.replace(/[\[\]]/g, '').split('=')[0];
   const keyOf = (t, i) => t.getAttribute('data-turn-key') || String(i + 1);
-  const at = turns.findIndex((t, i) => keyOf(t, i) === sel.seen);
-  if (at < 0) return { found: false, turns: [] };
+  const at = sel.seen ? turns.findIndex((t, i) => keyOf(t, i) === sel.seen) : -1;  // "" = from the start
+  if (sel.seen && at < 0) return { found: false, turns: [] };
   return { found: true, turns: turns.slice(at + 1).map((t, j) => {
     const st = t.matches(sel.turn_state) ? t : t.querySelector(sel.turn_state);
     const user = t.querySelector(sel.user_unit);
@@ -985,7 +986,20 @@ class ChatGPT:
                     text = (await self.copied_reply()) or text
                 outputs = await self.outputs_of_last_turn()
             items.append({"user": t["userText"], "text": text, "outputs": outputs})
+        if seen_key == "":
+            items = items[-10:]  # a chat seen for the first time: its recent turns, not a flood
         return None if key == seen_key else {"key": key, "items": items}
+
+    async def newest_project_chat(self) -> str | None:
+        """URL of the project's most recently used chat, read from the sidebar of the open page
+        (the sidebar lists chats newest first). None when the sidebar shows no project chat."""
+        m = re.search(r"(g-p-[0-9a-f]+)", self.cfg.get("project_url", ""))
+        if not m or not self.page:
+            return None
+        href = await self.page.evaluate(
+            "(p) => { const a = document.querySelector('nav a[href*=\"' + p + '\"][href*=\"/c/\"]'); return a ? a.getAttribute('href') : null; }",
+            m.group(1))
+        return ("https://chatgpt.com" + href.split("?")[0]) if href and href.startswith("/") else None
 
     async def collect_outputs(self, dest: Path) -> list[Path]:
         """Save the last reply's files (its Download buttons) and images into dest."""
@@ -1093,6 +1107,7 @@ def make_bridge(cfg: dict, state: dict):
             self.halted = self.state.get("halted")  # {"since": ...} while the user has paused the group
             self.gpt_pending = False  # GPT was addressed while halted
             self.status_mtime = None
+            self.follow_candidate = None  # a newer chat of the project, seen once
             # Claude watcher
             w = self.cfg.get("claude_watch", {})
             c = self.cfg.get("claude", {})
@@ -1432,21 +1447,45 @@ def make_bridge(cfg: dict, state: dict):
                 try:
                     async with self.page_lock:
                         found = await self.gpt.check_for_web_turns(self.state.get("last_turn_key"))
-                    if not found:
-                        continue
-                    self.state["last_turn_key"] = found["key"]
-                    save_json(STATE_FILE, self.state)
-                    for item in found["items"]:
-                        user = (item["user"] or "").strip()
-                        self.state["turns_in_chat"] = int(self.state.get("turns_in_chat", 0)) + 1
-                        self.streak, self.capped = 0, False  # a human started this turn
-                        quote = "\n".join("> " + line for line in user[:800].splitlines() if line.strip())
-                        log.info("mirroring a turn typed in ChatGPT (%d chars)", len(item["text"]))
-                        await self.post_reply(f"{S('mirror_header')}\n{quote}\n\n{item['text']}", True, item["outputs"])
+                        newest = await self.gpt.newest_project_chat()
+                    if found:
+                        self.state["last_turn_key"] = found["key"]
+                        save_json(STATE_FILE, self.state)
+                        for item in found["items"]:
+                            user = (item["user"] or "").strip()
+                            self.state["turns_in_chat"] = int(self.state.get("turns_in_chat", 0)) + 1
+                            self.streak, self.capped = 0, False  # a human started this turn
+                            quote = "\n".join("> " + line for line in user[:800].splitlines() if line.strip())
+                            log.info("mirroring a turn typed in ChatGPT (%d chars)", len(item["text"]))
+                            await self.post_reply(f"{S('mirror_header')}\n{quote}\n\n{item['text']}", True, item["outputs"])
+                    # The user went on in another chat of the project: follow them there. Seen as the
+                    # newest chat on two looks in a row, so one odd sidebar render does not move us.
+                    if newest and conv_id(newest) != conv_id(self.gpt.chat_url):
+                        if self.follow_candidate == conv_id(newest):
+                            self.follow_candidate = None
+                            await self.follow_chat(newest)
+                        else:
+                            self.follow_candidate = conv_id(newest)
+                    else:
+                        self.follow_candidate = None
                 except NeedsHuman as e:
                     log.warning("mirror check needs the user: %s", e)
                 except Exception:
                     log.exception("mirror check failed")
+
+        async def follow_chat(self, url: str) -> None:
+            """Make url the bridge's chat: channel messages go there, and its turns get mirrored."""
+            seen = self.state.setdefault("chat_seen", {})
+            seen[conv_id(self.gpt.chat_url)] = self.state.get("last_turn_key")
+            while len(seen) > 30:
+                seen.pop(next(iter(seen)))
+            self.state["chat_url"] = url
+            self.state["last_turn_key"] = seen.get(conv_id(url)) or ""  # "" = mirror its recent turns
+            self.state["intro_sent"] = False  # GPT in that chat has not heard how the group works
+            self.state["turns_in_chat"] = 0
+            save_json(STATE_FILE, self.state)
+            log.info("following the user to chat %s", url)
+            await self.note(S("followed_chat", url=url), log_channel=True)
 
         def requeue(self, batch: str, atts) -> None:
             """Put a batch that did not reach GPT back at the front of the buffer."""
