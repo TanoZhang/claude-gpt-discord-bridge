@@ -122,6 +122,7 @@ The official plugin (`discord@claude-plugins-official`) ignores every message fr
 | `!gpt url <link>` | Switch to another ChatGPT conversation |
 | `!gpt cap <n>` | Change the loop cap |
 | `!gpt show` / `!gpt hide` | Show the browser to log in or pass a check, then hide it |
+| `@Codex …` / `!codex status\|stop\|new` | Ask Codex / its state, stop its current turn, start a new Codex session (only with `codex` enabled) |
 | `!halt` / `!resume` | Pause the group (GPT quiet, Claude stops after its current step) / continue |
 
 Stop or restart: `scripts\stop.ps1 [-Restart]`. A restarted Claude session starts fresh; `scripts\launch-claude.ps1 -Resume <session-id>` continues an old one.
@@ -139,9 +140,25 @@ Stop or restart: `scripts\stop.ps1 [-Restart]`. A restarted Claude session start
 | `permissions_in_channel` | `true` | Claude's Allow/Deny buttons in the channel instead of DMs (takes effect when Claude restarts) |
 | `max_file_mb` | server limit | Cap for files posted to Discord |
 | `claude_watch.ctx_limit` | 150000 | Claude context (tokens) at which the bridge asks for a fresh session |
+| `browser_idle_close_s` | 180 | Close the headless browser after this many idle seconds; the next request or web check reopens it (0 = keep it open) |
+| `archive_dir` | `""` | Folder for a local Markdown copy of the channels (`<channel>/<date>.md`, attachments in `files/`); empty = no archive |
+| `claude_watch.ensure_script` | `""` | PowerShell script that starts Claude; when set, an @Claude while no session runs starts one (Windows) |
+| `codex` | disabled | Optional Codex member, see below |
 | `intro` / `handoff_prompt` | English | What GPT is told about the group, and how it is asked for a summary |
 | `strings` | `{}` | Override or translate any message the bridge posts |
 | `selectors` | ChatGPT as of 2026-11 | Fix these when ChatGPT's markup changes |
+
+## Codex (optional)
+
+The bridge can add the Codex CLI as a third member. It needs the Codex CLI installed and signed in, and a second Discord bot for Codex (invite it to the channel with read and send permissions).
+
+1. Put its token in `codex-bot.env` in the repository root (`CODEX_DISCORD_BOT_TOKEN=...`), or point `codex.token_file` at another file.
+2. In `config.json` set `codex.enabled` to `true`, `codex.workdir` to the project folder Codex works in, and `codex.bot_id` to the Codex bot's user id. To let Claude hear the Codex bot, add its id to `allowFrom` in the Discord plugin's `access.json` (the bridge itself ignores that entry as a human).
+3. Restart the bridge.
+
+Codex is a group member like GPT: it receives every channel message since its own last reply (up to `codex.context_max_chars`), each with the speaker in front, but it only runs when someone writes `@Codex` (the owner, Claude or GPT). It answers in the channel where it was asked, and mentions `@Claude` or `@GPT` only when it needs them. Files it should post go to the outbox and are referenced as `[[discord-file:PATH]]`. The Codex thread is resumed between turns and renewed after `codex.rotate_turns` turns. If the Codex bot cannot log in, its replies are posted by the GPT bot with a `[Codex]` prefix. Other options: `executable` (auto-detected when empty), `sandbox` (`workspace-write` or `danger-full-access`), `network`, and `intro` to replace the default instructions.
+
+Owner commands: `!codex status`, `!codex stop` (kill the current turn), `!codex new` (start a fresh Codex session next time). `!halt` pauses Codex too.
 
 ## Caveats
 

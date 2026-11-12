@@ -16,13 +16,15 @@
     "prompt_template": "prompts/claude-prompt.md"
   },
 
-  "claude_watch": { "ctx_limit": 150000 },
+  "claude_watch": { "ctx_limit": 150000, "ensure_script": "" },
   "permissions_in_channel": true,
   "max_file_mb": null,
 
   "loop_cap": 4,
   "mirror_interval_s": 60,
   "rollover_turns": 40,
+  "browser_idle_close_s": 180,
+  "archive_dir": "",
   "reply_timeout_s": 900,
   "first_token_timeout_s": 120,
   "quiet_period_s": 3,
@@ -31,6 +33,18 @@
   "browser_mode": "headless",
   "browser_channel": "chrome",
   "access_file": "~/.claude/channels/discord/access.json",
+
+  "codex": {
+    "enabled": false,
+    "workdir": "C:\\path\\to\\your\\project",
+    "bot_id": "000000000000000000",
+    "token_file": "",
+    "executable": "",
+    "sandbox": "workspace-write",
+    "network": true,
+    "context_max_chars": 20000,
+    "rotate_turns": 40
+  },
 
   "strings": {}
 }

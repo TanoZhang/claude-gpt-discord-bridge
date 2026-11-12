@@ -88,7 +88,7 @@ DEFAULT_STRINGS = {
     "reason_auto": "this chat reached {n} turns",
     "handoff_header": "[Handoff summary from the previous chat]",
     "halt_already": "⏸️ Already paused. Send `!resume` to continue.",
-    "halt_claude": "The user paused the group: finish the step you are on, say where you stopped, start nothing new, do not message GPT. Running background tasks may finish; post their results after [继续].",
+    "halt_claude": "The user paused the group: finish the step you are on, say where you stopped, start nothing new, do not message GPT. Running background tasks may finish; post their results after [Resume].",
     "halt_done": "⏸️ Paused: GPT stays quiet and Claude stops after its current step. Send `!resume` to continue.",
     "resume_not_halted": "▶️ Nothing is paused.",
     "resume_claude": "The user resumed the group: continue where you stopped, and say in one line what you continue with.",
@@ -120,6 +120,27 @@ DEFAULT_STRINGS = {
     "report_head": "\U0001f4e5 [report] <@{claude}> A report from another session: **{title}** ({n} chars)\nFull text: `{path}`\n\n",
     "status_head": "\U0001f4cc **Status** (updated by Claude {stamp})\n\n",
     "status_cut": "\n... (too long, the rest is cut)",
+    "claude_asleep_limit": "💤 Claude's usage limit has not reset yet; it cannot be woken before about {when}.",
+    "claude_waking": "💤 Claude is not running; waking it (about a minute)...",
+    "claude_wake_failed": "Claude could not be started. Start its session by hand.",
+    "wake_claude": "You are a freshly started session: the user mentioned you in Discord and that woke you. Read `{handoff}` first, check `git worktree list`, then answer the user's message in {where} (you did not receive it): \"{text}\"",
+    "codex_loop_cap": "(AI messages in a row: {n}. Codex is not starting; waiting for a human.)",
+    "codex_failed": "(Codex did not finish this time: {err}. The messages are kept; the next @Codex sends them again.)",
+    "codex_limit": "Codex usage or rate limit reached: {err}",
+    "codex_empty": "(Codex returned nothing.)",
+    "codex_too_big": "(These files are over Discord's upload limit and were not sent: {files})",
+    "codex_recent_header": "[Your most recent replies in the previous session]",
+    "codex_context_header": "[Group chat messages since your last reply]",
+    "codex_files_header": "[Attachments sent with the messages, saved locally]",
+    "codex_target": "[This reply will be posted in the {name}]",
+    "codex_main": "main channel",
+    "codex_log": "log channel",
+    "codex_stopped": "Codex's current turn was stopped.",
+    "codex_not_running": "Codex is not running right now.",
+    "codex_new": "The next @Codex starts a new Codex session.",
+    "codex_status": "Codex: {state}; session {session}, {turns} turns so far; {pending} messages waiting for it; posting as {poster}.",
+    "codex_running": "running", "codex_idle": "idle", "codex_new_session": "(new)",
+    "codex_poster_bot": "the Codex bot", "codex_poster_gpt": "the GPT bot (Codex bot not logged in)",
     "pin_failed": "(I could not pin this status message: the GPT bot lacks the Pin Messages permission. Pin it once by hand.)",
 }
 STR = dict(DEFAULT_STRINGS)
@@ -184,6 +205,8 @@ def load_config() -> dict:
     cfg.setdefault("browser_channel", "chrome")
     cfg.setdefault("mirror_interval_s", 60)   # 0 = do not mirror turns typed in ChatGPT itself
     cfg.setdefault("rollover_turns", 40)      # 0 = never start a new chat automatically
+    cfg.setdefault("archive_dir", "")         # "" = no local copy of the Discord channels
+    cfg.setdefault("browser_idle_close_s", 180)  # close the headless browser after this long unused; 0 = keep it open
     cfg.setdefault("handoff_prompt", "[Handoff] This chat is getting long, so I am moving to a new chat in the same project. Write a handoff summary (under 1500 words): goals, decisions made, tasks in progress, to-dos, who does what. Output only the summary.")
     cfg.setdefault("intro", DEFAULT_INTRO)
     STR.update(cfg.get("strings", {}))
@@ -386,7 +409,7 @@ def fence_tables(text: str, max_width: int = 60) -> str:
     return "\n".join(out)
 
 
-ADDRESS_RE = re.compile(r"(?:^\s*gpt\s*[,，:：])|(?:@gpt\b)", re.I)
+ADDRESS_RE = re.compile(r"(?:^\s*gpt\s*[,\uff0c:\uff1a])|(?:@gpt\b)", re.I)
 
 
 # ---------------------------------------------------------------- ChatGPT driver
@@ -673,8 +696,8 @@ class ReplyFailed(Exception):
         self.too_long = too_long
 
 
-ERROR_RE = re.compile(r"something went wrong|unknown error|error (generating|occurred)|network error|try again|retry|出错|错误|重试|请稍后", re.I)
-TOO_LONG_RE = re.compile(r"too long|too large|maximum (context|length)|context (window|length)|start (a )?new chat|对话太长|过长|新对话", re.I)
+ERROR_RE = re.compile(r"something went wrong|unknown error|error (generating|occurred)|network error|try again|retry|\u51fa\u9519|\u9519\u8bef|\u91cd\u8bd5|\u8bf7\u7a0d\u540e", re.I)
+TOO_LONG_RE = re.compile(r"too long|too large|maximum (context|length)|context (window|length)|start (a )?new chat|\u5bf9\u8bdd\u592a\u957f|\u8fc7\u957f|\u65b0\u5bf9\u8bdd", re.I)
 
 
 class NeedsHuman(Exception):
@@ -702,6 +725,8 @@ class ChatGPT:
         self.last_used = 0.0
         self.last_key: str | None = None  # last turn the bridge itself produced
         self.too_large = False  # ChatGPT answered our last send with 413 conversation_too_large
+        self.crashed = False  # the page's renderer died: page calls would hang, so start a new browser
+        self.throttled_until = 0.0  # ChatGPT said 429: no page loads before this time
 
     @property
     def chat_url(self) -> str:
@@ -729,7 +754,9 @@ class ChatGPT:
         self.ctx = await self.pw.chromium.launch_persistent_context(**kw)
         await self.ctx.add_init_script(script=COPY_HOOK_JS)
         self.page = self.ctx.pages[0] if self.ctx.pages else await self.ctx.new_page()
+        self.crashed = False
         self.page.on("response", self._on_response)
+        self.page.on("crash", self._on_crash)
         if self.mode == "headless":
             ua = await self.page.evaluate("navigator.userAgent")
             if "HeadlessChrome" in ua:
@@ -746,11 +773,28 @@ class ChatGPT:
         if resp.status == 413 and "/conversation" in resp.url and resp.request.method == "POST":
             self.too_large = True
             log.warning("ChatGPT rejected the message: conversation too large (413)")
+        # Constant reloads can get the account throttled (HTTP 429). Remember how long to keep away;
+        # retrying sooner only extends it.
+        if resp.status == 429 and "chatgpt.com" in resp.url:
+            try:
+                wait = int(resp.headers.get("retry-after", "") or 300)
+            except ValueError:
+                wait = 300
+            until = time.time() + min(max(wait, 60), 1800)
+            if until > self.throttled_until:
+                self.throttled_until = until
+                log.warning("ChatGPT answered 429 (rate limited); keeping away for %d s", until - time.time())
+
+    def _on_crash(self, page) -> None:
+        # The tab's renderer died: every later page call would hang and hold the page lock
+        # for hours. Mark it; the next use starts a new browser.
+        self.crashed = True
+        log.warning("the ChatGPT page crashed; the browser will be restarted")
 
     async def close(self) -> None:
         if self.ctx is not None:
             try:
-                await self.ctx.close()
+                await asyncio.wait_for(self.ctx.close(), 30)  # a crashed browser may not answer
             except Exception:
                 pass
         self.ctx = None
@@ -766,7 +810,7 @@ class ChatGPT:
             self.pw = None
 
     def alive(self) -> bool:
-        return self.page is not None and not self.page.is_closed()
+        return self.page is not None and not self.page.is_closed() and not self.crashed
 
     async def open_chat(self, url: str | None = None) -> None:
         url = url or self.chat_url
@@ -950,6 +994,9 @@ class ChatGPT:
         finished turns typed in ChatGPT itself, [{user, text, outputs}], oldest first; key is the
         newest finished turn. A turn still being answered is left for the next look. Turns the
         bridge sent (they start with a [speaker] tag) are skipped. Returns None when nothing is new."""
+        if self.crashed or not self.alive():
+            await self.start()  # the browser is closed while idle; a check opens it again
+        self.last_used = time.monotonic()
         await self.open_chat()
         turn = await self.last_turn()
         for _ in range(15):  # turns render a moment after the composer appears
@@ -1108,8 +1155,12 @@ def make_bridge(cfg: dict, state: dict):
             self.gpt_pending = False  # GPT was addressed while halted
             self.status_mtime = None
             self.follow_candidate = None  # a newer chat of the project, seen once
+            self.waking = False  # a wake-up of Claude is in progress
+            self.archive_dir = Path(os.path.expanduser(cfg["archive_dir"])) if cfg.get("archive_dir") else None
+            self.archive_lock = asyncio.Lock()
             # Claude watcher
             w = self.cfg.get("claude_watch", {})
+            self.cw_wake = bool(w.get("ensure_script"))  # waking a stopped Claude needs an explicit ensure_script
             c = self.cfg.get("claude", {})
             if c.get("workdir"):
                 w.setdefault("project_dir", str(Path.home() / ".claude" / "projects" / re.sub(r"[^A-Za-z0-9]", "-", c["workdir"])))
@@ -1130,6 +1181,14 @@ def make_bridge(cfg: dict, state: dict):
             self.cw_nudged_at = 0.0
             self.cw_paused_until: float | None = None
             self.cw_limit_text = ""
+            # Codex CLI as a group member (optional, config "codex")
+            self.codex = None
+            if cfg.get("codex", {}).get("enabled"):
+                sys.path.insert(0, str(Path(__file__).resolve().parent))
+                from codex_agent import CodexAgent
+                self.codex = CodexAgent(self, discord, cfg, state, lambda: save_json(STATE_FILE, self.state), log,
+                                        {"split_message": split_message, "fence_tables": fence_tables,
+                                         "outbox": OUTBOX_DIR, "root": ROOT, "S": S})
 
         # -- helpers
         @property
@@ -1142,6 +1201,8 @@ def make_bridge(cfg: dict, state: dict):
             ids = {int(x) for x in group.get("allowFrom", []) if str(x).isdigit()}
             ids.discard(self.user.id if self.user else 0)
             ids.discard(self.claude_id)
+            if self.codex:
+                ids.discard(self.codex.bot_id)
             return ids or {self.owner_id}
 
         def in_channel(self, msg) -> bool:
@@ -1274,6 +1335,9 @@ def make_bridge(cfg: dict, state: dict):
             self.loop.create_task(self.claude_watch())
             self.loop.create_task(self.reports_watch())
             self.loop.create_task(self.status_watch())
+            self.loop.create_task(self.browser_idle_watch())
+            if self.codex and self.codex.enabled:
+                self.loop.create_task(self.codex.start())
 
         async def on_ready(self) -> None:
             log.info("discord connected as %s (%s)", self.user, self.user.id)
@@ -1290,21 +1354,101 @@ def make_bridge(cfg: dict, state: dict):
                     log.warning("browser needs the user: %s", e)
                 except Exception:
                     log.exception("browser start failed")
+            if self.archive_dir is not None:
+                self.loop.create_task(self.archive_backfill())
             if not self.caught_up:
                 self.caught_up = True
                 await self.catch_up()
+
+        # -- Archive: a local copy of the channels, <archive_dir>/<channel>/<YYYY-MM-DD>.md
+        # (local time) with attachments in <channel>/files/. Append-only; edits are not tracked.
+        async def archive(self, msg) -> None:
+            async with self.archive_lock:
+                try:
+                    await self._archive_one(msg)
+                except Exception:
+                    log.exception("archive failed for message %s", msg.id)
+
+        async def archive_backfill(self) -> None:
+            """Everything since the last archived message of each channel (all of it the first time)."""
+            async with self.archive_lock:
+                for ch in (self.channel, self.log_channel):
+                    if ch is None:
+                        continue
+                    n = 0
+                    for attempt in range(5):  # Discord has short outages (503); a gap here would stay a gap
+                        last = int(self.state.get("archive_last", {}).get(str(ch.id), 0))
+                        try:
+                            async for m in ch.history(limit=None, after=discord.Object(id=last) if last else None, oldest_first=True):
+                                await self._archive_one(m)
+                                n += 1
+                            break
+                        except Exception as e:
+                            log.warning("archive backfill in #%s failed (try %d): %s", getattr(ch, "name", ch.id), attempt + 1, e)
+                            await asyncio.sleep(15 * (attempt + 1))
+                    if n:
+                        log.info("archive backfill: %d messages from #%s", n, getattr(ch, "name", ch.id))
+
+        async def _archive_one(self, msg) -> None:
+            ch = msg.channel
+            marks = self.state.setdefault("archive_last", {})
+            if msg.id <= int(marks.get(str(ch.id), 0)):
+                return  # already archived
+            when = msg.created_at.astimezone()
+            folder = self.archive_dir / safe_name(getattr(ch, "name", None) or str(ch.id))
+            folder.mkdir(parents=True, exist_ok=True)
+            day = folder / f"{when:%Y-%m-%d}.md"
+            lines = []
+            if not day.exists():
+                lines.append(f"# #{getattr(ch, 'name', ch.id)} {when:%Y-%m-%d}\n")
+            known = {self.claude_id, self.user.id} | ({self.codex.bot_id} if self.codex else set())
+            who = msg.author.display_name + (" (bot)" if msg.author.bot and msg.author.id not in known else "")
+            lines.append(f"---\n\U0001f552 **{when:%H:%M:%S} {who}**\n")  # not a heading: messages have their own
+            body = msg.clean_content.strip()
+            if not body and msg.is_system():
+                body = f"*({msg.system_content})*" if msg.system_content else ""
+            if not body and msg.embeds:
+                e = msg.embeds[0]
+                body = "\n".join(x for x in (e.title, e.description) if x)
+            if body:
+                lines.append(body)
+            for att in msg.attachments:
+                name = f"{msg.id}-{safe_name(att.filename)}"
+                if att.size <= 50 * 1024 * 1024:
+                    try:
+                        (folder / "files").mkdir(exist_ok=True)
+                        await att.save(folder / "files" / name)
+                        lines.append(f"\U0001f4ce [{att.filename}](files/{name})")
+                        continue
+                    except Exception as e:
+                        log.warning("archive: could not save %s: %s", att.filename, e)
+                lines.append(f"\U0001f4ce {att.filename} ({att.size} bytes, not saved)")
+            with day.open("a", encoding="utf-8") as f:
+                f.write("\n".join(lines) + "\n\n")
+            marks[str(ch.id)] = str(msg.id)
+            save_json(STATE_FILE, self.state)
 
         async def catch_up(self) -> None:
             """After a restart, re-queue everything said since GPT's last real reply."""
             last_id = self.state.get("last_reply_msg_id")
             if not last_id or self.channel is None:
                 return
+            msgs = None
+            for attempt in range(3):  # Discord has short outages (503) right after connecting
+                try:
+                    msgs = []
+                    for ch in (self.channel, self.log_channel):
+                        if ch is not None:
+                            msgs += [m async for m in ch.history(limit=100, after=discord.Object(id=int(last_id)), oldest_first=True)]
+                    break
+                except Exception as e:
+                    msgs = None
+                    log.warning("catch-up: reading the channels failed (try %d): %s", attempt + 1, e)
+                    await asyncio.sleep(10 * (attempt + 1))
+            if msgs is None:
+                return
             try:
                 n, pending = 0, False
-                msgs = []
-                for ch in (self.channel, self.log_channel):
-                    if ch is not None:
-                        msgs += [m async for m in ch.history(limit=100, after=discord.Object(id=int(last_id)), oldest_first=True)]
                 msgs.sort(key=lambda m: m.id)
                 for msg in msgs:
                     if msg.author.id == self.user.id or (msg.author.bot and msg.author.id != self.claude_id):
@@ -1326,24 +1470,56 @@ def make_bridge(cfg: dict, state: dict):
                 log.exception("catch-up failed")
 
         async def on_message(self, msg) -> None:
+            if self.archive_dir is not None and self.in_channel(msg):
+                self.loop.create_task(self.archive(msg))
+            if (self.cw_wake and self.in_channel(msg)
+                    and ((not msg.author.bot and msg.author.id in self.humans())
+                         or (self.codex is not None and self.codex.is_codex(msg)))
+                    and (any(u.id == self.claude_id for u in msg.mentions) or re.search(r"@(bot)?claude\b", msg.content or "", re.I))):
+                self.loop.create_task(self.wake_claude(msg))
+            if self.codex and self.codex.enabled and self.user is not None and self.in_channel(msg):
+                try:
+                    await self.codex_observe(msg)
+                except Exception:
+                    log.exception("codex observe failed")
             try:
                 await self.handle(msg)
             except Exception:
                 log.exception("on_message failed")
 
+        async def codex_observe(self, msg) -> None:
+            """Feed Codex the channel like GPT gets it; the owner, Claude and GPT may call it."""
+            content = (msg.content or "").strip()
+            if msg.author.id == self.user.id:
+                if content.startswith(("**[Codex]**", "\u2699")):
+                    return  # Codex's fallback posts and bridge control messages
+                speaker = "GPT"
+            elif msg.author.id == self.claude_id:
+                speaker = S("claude_label")
+            elif msg.author.bot:
+                return
+            elif msg.author.id in self.humans():
+                if content.startswith("!"):
+                    return
+                speaker = self.speaker(msg)
+            else:
+                return
+            await self.codex.observe(msg, self.tag(speaker, msg), self.clean(msg), may_trigger=True)
+
         async def handle(self, msg) -> None:
             if not self.in_channel(msg) or self.user is None or msg.author.id == self.user.id:
                 return
             if msg.author.bot:
-                if msg.author.id != self.claude_id:
+                who = "Codex" if self.codex and self.codex.is_codex(msg) else "Claude"
+                if msg.author.id != self.claude_id and who != "Codex":
                     return
                 now = time.monotonic()
-                if now - self.last_claude_at > 5:  # chunks of one Claude reply count once
+                if now - self.last_claude_at > 5:  # chunks of one bot reply count once
                     self.streak += 1
                 self.last_claude_at = now
-                self.remember(self.tag("Claude", msg), self.clean(msg), msg.attachments)
+                self.remember(self.tag(who, msg), self.clean(msg), msg.attachments)
                 if await self.addressed_to_gpt(msg):
-                    log.info("claude -> gpt (streak=%d)%s", self.streak, " [log]" if self.is_log(msg) else "")
+                    log.info("%s -> gpt (streak=%d)%s", who.lower(), self.streak, " [log]" if self.is_log(msg) else "")
                     self.target_for(msg)
                     self.request_gpt()
                 return
@@ -1360,6 +1536,9 @@ def make_bridge(cfg: dict, state: dict):
                 return
             if content.lower().startswith("!gpt"):
                 await self.command(content[4:].strip())
+                return
+            if low.startswith("!codex") and self.codex:
+                await self.note(await self.codex.command(content[6:].strip()))
                 return
             self.remember(self.tag(self.speaker(msg), msg), self.clean(msg), msg.attachments)
             if await self.addressed_to_gpt(msg):
@@ -1434,20 +1613,47 @@ def make_bridge(cfg: dict, state: dict):
             save_json(STATE_FILE, self.state)
             await self.note(S("rollover_done", url=url), log_channel=True)
 
+        async def browser_idle_watch(self) -> None:
+            """Close the browser after browser_idle_close_s without use. A request or a web check
+            opens it again, so an idle bridge loads nothing from ChatGPT."""
+            idle_s = int(self.cfg.get("browser_idle_close_s", 180))
+            if idle_s <= 0:
+                return
+            while not self.is_closed():
+                await asyncio.sleep(30)
+                if (not self.gpt.alive() or self.busy or self.page_lock.locked() or self.trigger.is_set()
+                        or time.monotonic() - self.gpt.last_used < idle_s):
+                    continue
+                async with self.page_lock:
+                    await self.gpt.close()
+                log.info("browser closed after %d s idle; the next request or web check reopens it", idle_s)
+
         async def mirror_watch(self) -> None:
             """Post turns the user typed in ChatGPT itself (not through Discord) to the channel."""
             await self.wait_until_ready()
             interval = int(self.cfg.get("mirror_interval_s", 0))
             if interval <= 0:
                 return
+            fails = 0  # page-load failures in a row: back off so a throttled account is not hammered
             while not self.is_closed():
-                await asyncio.sleep(interval)
-                if self.busy or self.page_lock.locked() or self.trigger.is_set() or not self.gpt.alive() or self.channel is None:
+                await asyncio.sleep(min(interval * (2 ** min(fails, 4)), 3600))
+                if self.busy or self.page_lock.locked() or self.trigger.is_set() or self.channel is None:
                     continue
+                if time.time() < self.gpt.throttled_until:
+                    continue  # rate limited: a check would only reload the page again
                 try:
-                    async with self.page_lock:
-                        found = await self.gpt.check_for_web_turns(self.state.get("last_turn_key"))
-                        newest = await self.gpt.newest_project_chat()
+                    async def look():
+                        async with self.page_lock:
+                            return (await self.gpt.check_for_web_turns(self.state.get("last_turn_key")),
+                                    await self.gpt.newest_project_chat())
+                    try:
+                        # never hold the page for long: a hung page call must not block messages to GPT
+                        found, newest = await asyncio.wait_for(look(), 300)
+                        fails = 0
+                    except asyncio.TimeoutError:
+                        log.warning("mirror check hung for 5 min; the browser will be restarted")
+                        self.gpt.crashed = True
+                        continue
                     if found:
                         self.state["last_turn_key"] = found["key"]
                         save_json(STATE_FILE, self.state)
@@ -1469,7 +1675,9 @@ def make_bridge(cfg: dict, state: dict):
                     else:
                         self.follow_candidate = None
                 except NeedsHuman as e:
-                    log.warning("mirror check needs the user: %s", e)
+                    fails += 1
+                    log.warning("mirror check needs the user: %s (next look in %d s)", e,
+                                min(interval * (2 ** min(fails, 4)), 3600))
                 except Exception:
                     log.exception("mirror check failed")
 
@@ -1513,7 +1721,7 @@ def make_bridge(cfg: dict, state: dict):
             self.state["halted"] = self.halted
             save_json(STATE_FILE, self.state)
             log.info("halted by the user")
-            await self.control("[暂停]", S("halt_claude"))
+            await self.control("[Pause]", S("halt_claude"))
             await self.note(S("halt_done"))
 
         async def resume(self) -> None:
@@ -1524,8 +1732,10 @@ def make_bridge(cfg: dict, state: dict):
             self.state.pop("halted", None)
             save_json(STATE_FILE, self.state)
             log.info("resumed by the user")
-            await self.control("[继续]", S("resume_claude"))
+            await self.control("[Resume]", S("resume_claude"))
             await self.note(S("resume_done"))
+            if self.codex:
+                self.codex.resume()
             if self.gpt_pending:
                 self.gpt_pending = False
                 self.streak, self.capped = 0, False
@@ -1608,12 +1818,59 @@ def make_bridge(cfg: dict, state: dict):
             now = time.time()
             if self.cw_paused_until and now >= self.cw_paused_until + 60:
                 self.cw_paused_until = None
-                await self.control("[额度恢复]", S("limit_over_claude"))
+                await self.control("[Limit over]", S("limit_over_claude"))
             if (self.cw_ctx > self.cw_ctx_limit and now - self.cw_nudged_at > 7200
                     and not self.halted and not self.cw_paused_until):
                 self.cw_nudged_at = now
                 handoff, restart = self.cw_work / "handoff.md", self.cw_work / "restart.request"
-                await self.control("[上下文]", S("ctx_claude", k=self.cw_ctx // 1000, handoff=handoff, restart=restart))
+                await self.control("[Context]", S("ctx_claude", k=self.cw_ctx // 1000, handoff=handoff, restart=restart))
+
+        async def claude_running(self) -> bool:
+            name = (self.cw_name or "").replace("'", "''")  # only this project's session counts
+            ps = ("@(Get-CimInstance Win32_Process -Filter \"Name='claude.exe'\" | "
+                  "Where-Object { $_.CommandLine -match '--channels' -and $_.CommandLine -like '*" + name + "*' }).Count")
+            proc = await asyncio.create_subprocess_exec(
+                "powershell.exe", "-NoProfile", "-Command", ps, stdout=asyncio.subprocess.PIPE,
+                creationflags=0x08000000)  # CREATE_NO_WINDOW
+            out, _ = await proc.communicate()
+            try:
+                return int(out.decode().strip() or 0) > 0
+            except ValueError:
+                return True  # unsure: do not start a second one
+
+        async def wake_claude(self, msg) -> None:
+            """Someone @mentioned Claude but its session is not running (PC restarted, crash):
+            start it with the ensure script, then hand it the handoff and the message it missed.
+            Only active when config claude_watch.ensure_script is set."""
+            if self.waking or not self.cw_ensure or await self.claude_running():
+                return
+            if self.cw_paused_until and time.time() < self.cw_paused_until:
+                when = time.strftime("%H:%M", time.localtime(self.cw_paused_until))
+                await self.note(S("claude_asleep_limit", when=when))
+                return
+            self.waking = True
+            try:
+                log.info("Claude is not running; waking it for message %s", msg.id)
+                await self.note(S("claude_waking"))
+                ps = ""
+                if self.cw_lock:
+                    ps += f"Remove-Item '{self.cw_lock}' -ErrorAction SilentlyContinue; "
+                ps += f"& '{self.cw_ensure}'"
+                proc = await asyncio.create_subprocess_exec("powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass",
+                                                            "-Command", ps, creationflags=0x08000000)
+                await proc.wait()
+                await asyncio.sleep(50)  # the new session needs a moment to connect to Discord
+                if not await self.claude_running():
+                    await self.note(S("claude_wake_failed"))
+                    return
+                self.cw_file, self.cw_ctx, self.cw_nudged_at = None, 0, time.time()
+                handoff = self.cw_work / "handoff.md"
+                where = f"#{getattr(self.log_channel, 'name', 'log')}" if self.is_log(msg) else f"#{getattr(self.channel, 'name', 'channel')}"
+                await self.control("[Handoff]", S("wake_claude", handoff=handoff, where=where, text=self.clean(msg)[:600]))
+            except Exception:
+                log.exception("waking Claude failed")
+            finally:
+                self.waking = False
 
         async def restart_claude(self) -> None:
             """Fresh Claude session on request: stop the old one, start a new one, hand over."""
@@ -1631,7 +1888,7 @@ def make_bridge(cfg: dict, state: dict):
             await proc.wait()
             self.cw_file, self.cw_ctx, self.cw_nudged_at = None, 0, time.time()
             await asyncio.sleep(45)  # the new session needs a moment to connect to Discord
-            await self.control("[交接]", S("handoff_claude", handoff=handoff))
+            await self.control("[Handoff]", S("handoff_claude", handoff=handoff))
             log.info("Claude restarted as a fresh session")
 
         async def worker(self) -> None:
@@ -1647,6 +1904,10 @@ def make_bridge(cfg: dict, state: dict):
                 prompt = batch
                 target, self.reply_target = self.reply_target or self.channel, None
                 self.busy = True
+                wait = self.gpt.throttled_until - time.time()
+                if wait > 0:  # rate limited: hold the batch instead of reloading into more 429s
+                    log.info("ChatGPT is rate limiting; sending in %d s", wait)
+                    await asyncio.sleep(wait)
                 try:
                     if self.channel is None:
                         self.channel = await self.fetch_channel(self.channel_id)
@@ -1662,7 +1923,12 @@ def make_bridge(cfg: dict, state: dict):
                         files, failed = await self.download(atts)
                         if failed:
                             prompt += "\n\n" + S("attach_failed", names=", ".join(failed))
-                        text, finished, outputs = await self.gpt.ask(prompt, files)
+                        try:  # _wait_reply gives up after reply_timeout_s; this catches a hung page call
+                            text, finished, outputs = await asyncio.wait_for(
+                                self.gpt.ask(prompt, files), self.cfg["reply_timeout_s"] + 300)
+                        except asyncio.TimeoutError:
+                            self.gpt.crashed = True  # the next try starts a new browser
+                            raise RuntimeError("ChatGPT page stopped responding")
                     self.failures = 0
                     self.state.update(intro_sent=True, intro_version=version, last_turn_key=self.gpt.last_key,
                                       turns_in_chat=int(self.state.get("turns_in_chat", 0)) + 1)
@@ -1717,6 +1983,8 @@ def make_bridge(cfg: dict, state: dict):
         async def post_reply(self, text: str, finished: bool, outputs: list[Path] = (), channel=None) -> None:
             channel = channel or self.channel
             text = re.sub(r"@(?:bot)?claude\b", f"<@{self.claude_id}>", text, flags=re.I)
+            if self.codex and self.codex.enabled:
+                text = re.sub(r"@(?:bot)?codex\b", f"<@{self.codex.bot_id}>", text, flags=re.I)
             text = fence_tables(text)
             text = text.replace("\u2699\ufe0f", "").replace("\u2699", "")  # only the bridge writes control messages
             text = re.sub(r"@(everyone|here)\b", "@​\\1", text)
@@ -1860,6 +2128,8 @@ def make_bridge(cfg: dict, state: dict):
                 await asyncio.sleep(3)
 
         async def close(self) -> None:
+            if self.codex:
+                await self.codex.close()
             try:
                 await self.gpt.shutdown()
             except Exception:

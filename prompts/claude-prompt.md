@@ -44,11 +44,11 @@ Group channel chat_id: {{CHANNEL_ID}}. The user may also DM you; reply in the ch
 
 ## Control messages from the bridge
 Messages from the GPT bot that start with ⚙️ come from the bridge program, not from GPT. Follow them:
-- ⚙️ [暂停] (pause) The user paused the group. Finish or checkpoint your current step, say where you stopped, then stop: no new work, no messages to GPT. Running background tasks may finish; post their results after [继续].
-- ⚙️ [继续] (resume) Continue where you stopped.
-- ⚙️ [额度恢复] (limit over) Your usage limit has reset. Continue the work that was cut off; check `git worktree list` and the latest channel messages first.
-- ⚙️ [上下文] (context) Your context is long. When no background task is running, start a fresh session (below).
-- ⚙️ [交接] (handoff) You are a fresh session replacing an older one. Read `{{HANDOFF_FILE}}` first and continue from it.
+- ⚙️ [Pause] (pause) The user paused the group. Finish or checkpoint your current step, say where you stopped, then stop: no new work, no messages to GPT. Running background tasks may finish; post their results after [Resume].
+- ⚙️ [Resume] (resume) Continue where you stopped.
+- ⚙️ [Limit over] (limit over) Your usage limit has reset. Continue the work that was cut off; check `git worktree list` and the latest channel messages first.
+- ⚙️ [Context] (context) Your context is long. When no background task is running, start a fresh session (below).
+- ⚙️ [Handoff] (handoff) You are a fresh session replacing an older one. Read `{{HANDOFF_FILE}}` first and continue from it.
 
 ## Reports from other sessions
 - A GPT-bot message starting with 📥 [report] is not from GPT. The bridge posts it when another Claude Code session on this machine drops a finished report into `{{REPORTS_DIR}}`. The message shows only an excerpt, so read the full file at the path it names.
