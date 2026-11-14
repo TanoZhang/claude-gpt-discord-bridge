@@ -205,6 +205,7 @@ DEFAULT_STRINGS = {
     "tag_context": "[Context]", "tag_handoff": "[Handoff]",
     "claude_login_expired": "⚠️ Claude's login has expired, so it cannot answer. Run `claude` in a terminal, enter `/login`, then @Claude again. GPT and Codex are not affected.",
     "claude_not_logged_in": "⚠️ Claude started but is not logged in, so it cannot answer. Run `claude` in a terminal, enter `/login`, then @Claude again. GPT and Codex are not affected.",
+    "missed_claude": "While you were starting, these messages mentioned you. You may not have received them; answer the ones you have not answered:\n{text}",
     "wake_claude_resumed": "You were stopped while idle and have just been resumed in the same session. Answer the user's message in {where} (you did not receive it): \"{text}\"",
     "pin_failed": "(I could not pin this status message: the GPT bot lacks the Pin Messages permission. Pin it once by hand.)",
 }
@@ -1060,12 +1061,13 @@ class ChatGPT:
             log.exception("collecting reply files failed")
             return []
 
-    async def check_for_web_turns(self, seen_key: str | None, fresh_s: float = 0) -> dict | None:
+    async def check_for_web_turns(self, seen_key: str | None, fresh_s: float = 0, wait_busy_s: float = 0) -> dict | None:
         """Reload the chat and return {key, items} for the turns after seen_key: items are the
         finished turns typed in ChatGPT itself, [{user, text, outputs}], oldest first; key is the
         newest finished turn. A turn still being answered is left for the next look. Turns the
         bridge sent (they start with a [speaker] tag) are skipped. Returns None when nothing is new.
-        A page loaded less than fresh_s ago is not loaded again."""
+        A page loaded less than fresh_s ago is not loaded again. With wait_busy_s, a turn that is
+        still being answered is waited for (the caller is about to send, and would skip it)."""
         if self.crashed or not self.alive():
             await self.start()  # the browser is closed while idle; a check opens it again
         self.last_used = time.monotonic()
@@ -1085,6 +1087,12 @@ class ChatGPT:
         last_busy = turn["state"] not in (None, self.sel["turn_done"])
         if not last_busy and self.page and await self.page.locator(self.sel["stop"]).first.is_visible():
             last_busy = True
+        end = time.monotonic() + wait_busy_s
+        while last_busy and time.monotonic() < end:
+            await asyncio.sleep(2)
+            turn = await self.last_turn()
+            last_busy = (turn["state"] not in (None, self.sel["turn_done"])
+                         or await self.page.locator(self.sel["stop"]).first.is_visible())
         if seen_key is None:  # first look after start: remember, do not replay history
             return None if last_busy else {"key": turn["key"], "items": []}
         after = await self.page.evaluate(TURNS_AFTER_JS, {**self.sel, "seen": seen_key})
@@ -1106,7 +1114,7 @@ class ChatGPT:
                 if text:
                     text = (await self.copied_reply()) or text
                 outputs = await self.outputs_of_last_turn()
-            items.append({"user": t["userText"], "text": text, "outputs": outputs})
+            items.append({"key": t["key"], "user": t["userText"], "text": text, "outputs": outputs})
         if seen_key == "":
             items = items[-10:]  # a chat seen for the first time: its recent turns, not a flood
         return None if key == seen_key else {"key": key, "items": items}
@@ -1230,6 +1238,9 @@ def make_bridge(cfg: dict, state: dict):
             self.status_mtime = None
             self.follow_candidate = None  # a newer chat of the project, seen once
             self.waking = False  # a wake-up of Claude is in progress
+            self.web_fail = ("", 0)  # (turn key, failed posts) of a web turn that could not be posted
+            self.seen_ids: set[int] = set()  # Discord messages already in the buffer (live or from catch-up)
+            self.wake_missed: list = []  # messages that mentioned Claude while it was starting
             self.web_active_until = 0.0  # until then the web mirror looks every mirror_fast_s
             self.notes = collections.deque(maxlen=50)  # the bridge's own notices: status lines, not conversation
             self.archive_dir = Path(os.path.expanduser(cfg["archive_dir"])) if cfg.get("archive_dir") else None
@@ -1366,31 +1377,49 @@ def make_bridge(cfg: dict, state: dict):
                     return True
             return False
 
-        def remember(self, speaker: str, text: str, attachments=()) -> None:
+        def remember(self, speaker: str, text: str, attachments=(), msg_id: int = 0) -> bool:
+            """Add a channel message to GPT's buffer; False if it is already there."""
+            if msg_id:
+                if msg_id in self.seen_ids:
+                    return False
+                if len(self.seen_ids) > 5000:
+                    self.seen_ids.clear()
+                self.seen_ids.add(msg_id)
             now = time.monotonic()
             atts = list(attachments)
             if self.buffer and self.buffer[-1][0] == speaker and now - self.buffer[-1][2] < 10:
                 self.buffer[-1][1] += "\n" + text  # a long message split into chunks
                 self.buffer[-1][2] = now
                 self.buffer[-1][3].extend(atts)
+                self.buffer[-1][4] = max(self.buffer[-1][4], msg_id)
             else:
-                self.buffer.append([speaker, text, now, atts])
+                self.buffer.append([speaker, text, now, atts, msg_id])
             self.last_msg_at = now
+            return True
 
-        def take_buffer(self) -> tuple[str, list]:
-            """Everything said since GPT's last turn, and the attachments in it (newest kept)."""
-            lines = [t if s is None else f"[{s}] {t}" for s, t, _, _ in self.buffer]
-            atts = [a for entry in self.buffer for a in entry[3]]
+        def take_buffer(self) -> tuple[str, list, int]:
+            """Everything said since GPT's last turn, the attachments in it (newest kept), and the
+            id of the newest Discord message in it."""
+            entries = list(self.buffer)
+            atts = [a for entry in entries for a in entry[3]]
+            newest = max((entry[4] for entry in entries), default=0)
             self.buffer.clear()
             limit = self.cfg["context_max_chars"]
-            out, total = [], 0
-            for line in reversed(lines):
-                if total + len(line) > limit and out:
-                    out.append(S("omitted"))
-                    break
+            out, total, cut = [], 0, False
+            for s, t, _, _, _ in reversed(entries):
+                line = t if s is None else f"[{s}] {t}"
+                if s is None:  # a batch that already failed once holds the request itself: never cut it
+                    out.append(line)
+                    total += len(line)
+                    continue
+                if cut or (total + len(line) > limit and out):
+                    if not cut:
+                        out.append(S("omitted"))
+                    cut = True
+                    continue
                 out.append(line)
                 total += len(line)
-            return "\n\n".join(reversed(out)), atts[-MAX_UPLOAD_FILES:]
+            return "\n\n".join(reversed(out)), atts[-MAX_UPLOAD_FILES:], newest
 
         async def download(self, atts: list) -> tuple[list[Path], list[str]]:
             """Save Discord attachments for upload; return (paths, names that could not be fetched)."""
@@ -1531,8 +1560,9 @@ def make_bridge(cfg: dict, state: dict):
             save_json(STATE_FILE, self.state)
 
         async def catch_up(self) -> None:
-            """After a restart, re-queue everything said since GPT's last real reply."""
-            last_id = self.state.get("last_reply_msg_id")
+            """After a restart, re-queue everything said since the last batch that reached GPT
+            (older state files only know GPT's last reply), and feed Codex what it missed."""
+            last_id = self.state.get("delivered_msg_id") or self.state.get("last_reply_msg_id")
             if not last_id or self.channel is None:
                 return
             msgs = None
@@ -1541,7 +1571,8 @@ def make_bridge(cfg: dict, state: dict):
                     msgs = []
                     for ch in (self.channel, self.log_channel):
                         if ch is not None:
-                            msgs += [m async for m in ch.history(limit=100, after=discord.Object(id=int(last_id)), oldest_first=True)]
+                            # the newest 300: if more piled up, the latest are the ones still waiting for an answer
+                            msgs += [m async for m in ch.history(limit=300, after=discord.Object(id=int(last_id)), oldest_first=False)]
                     break
                 except Exception as e:
                     msgs = None
@@ -1550,24 +1581,43 @@ def make_bridge(cfg: dict, state: dict):
             if msgs is None:
                 return
             try:
-                n, pending = 0, False
+                n, pending, for_claude = 0, False, None
                 msgs.sort(key=lambda m: m.id)
+                codex_seen = int(self.state.get("codex", {}).get("seen_msg_id") or 0)
                 for msg in msgs:
-                    if msg.author.id == self.user.id or (msg.author.bot and msg.author.id != self.claude_id):
+                    # Codex gets what was said while the bridge was down, like a live message.
+                    if (self.codex and self.codex.enabled and codex_seen and msg.id > codex_seen
+                            and msg.author.id != self.user.id):
+                        try:
+                            await self.codex_observe(msg)
+                        except Exception:
+                            log.exception("codex catch-up failed")
+                    is_codex = self.codex is not None and self.codex.is_codex(msg)
+                    if msg.author.id == self.user.id or (msg.author.bot and msg.author.id != self.claude_id and not is_codex):
                         continue
                     if not msg.author.bot and msg.author.id not in self.humans():
                         continue
-                    if (msg.content or "").strip().lower().startswith("!gpt"):
+                    if (msg.content or "").strip().lower().startswith(("!gpt", "!codex", "!halt", "!pause", "!resume", "!continue")):
                         continue
-                    self.remember(self.tag("Claude" if msg.author.bot else self.speaker(msg), msg), self.clean(msg), msg.attachments)
+                    who = "Codex" if is_codex else "Claude" if msg.author.bot else self.speaker(msg)
+                    if not self.remember(self.tag(who, msg), self.clean(msg), msg.attachments, msg.id):
+                        continue  # arrived live while the history was being read
                     n += 1
                     if await self.addressed_to_gpt(msg):
                         pending = True
                         self.target_for(msg)
-                log.info("catch-up: %d messages since the last reply; addressed to GPT: %s", n, pending)
+                    if (not msg.author.bot or is_codex) and self.mentions_claude(msg):
+                        for_claude = msg
+                self.buffer.sort(key=lambda entry: entry[4])  # live messages may have been added before the old ones
+                log.info("catch-up: %d messages since the last batch; addressed to GPT: %s", n, pending)
                 if pending:
                     self.streak, self.capped = 0, False
-                    self.trigger.set()
+                    self.request_gpt()  # not while the group is paused
+                # Someone called Claude while the bridge was down and Claude is not running: wake it.
+                # Only for a recent message; an old one was most likely answered before Claude stopped.
+                if (for_claude is not None and self.cw_wake
+                        and (discord.utils.utcnow() - for_claude.created_at).total_seconds() < 600):
+                    self.loop.create_task(self.wake_claude(for_claude))
             except Exception:
                 log.exception("catch-up failed")
 
@@ -1619,7 +1669,7 @@ def make_bridge(cfg: dict, state: dict):
                 if now - self.last_claude_at > 5:  # chunks of one bot reply count once
                     self.streak += 1
                 self.last_claude_at = now
-                self.remember(self.tag(who, msg), self.clean(msg), msg.attachments)
+                self.remember(self.tag(who, msg), self.clean(msg), msg.attachments, msg.id)
                 if await self.addressed_to_gpt(msg):
                     log.info("%s -> gpt (streak=%d)%s", who.lower(), self.streak, " [log]" if self.is_log(msg) else "")
                     self.target_for(msg)
@@ -1642,7 +1692,7 @@ def make_bridge(cfg: dict, state: dict):
             if low.startswith("!codex") and self.codex:
                 await self.note(await self.codex.command(content[6:].strip()))
                 return
-            self.remember(self.tag(self.speaker(msg), msg), self.clean(msg), msg.attachments)
+            self.remember(self.tag(self.speaker(msg), msg), self.clean(msg), msg.attachments, msg.id)
             if await self.addressed_to_gpt(msg):
                 log.info("human -> gpt")
                 self.target_for(msg)
@@ -1665,8 +1715,7 @@ def make_bridge(cfg: dict, state: dict):
                 save_json(STATE_FILE, self.state)
                 await self.note(S("cap_set", n=self.cap))
             elif cmd == "url" and len(parts) > 1 and parts[1].startswith("https://chatgpt.com/"):
-                self.state["chat_url"] = parts[1].strip("<>")
-                save_json(STATE_FILE, self.state)
+                self.switch_chat(parts[1].strip("<>"))
                 await self.note(S("url_set"))
             elif cmd == "new":
                 fresh = len(parts) > 1 and parts[1].lower() in S("fresh_words").lower().split()
@@ -1775,24 +1824,45 @@ def make_bridge(cfg: dict, state: dict):
                     log.warning("mirror check needs the user: %s (next look in %d s)", e,
                                 min(interval * (2 ** min(fails, 4)), 3600))
                 except Exception:
-                    log.exception("mirror check failed")
+                    if not self.stopping:  # a look cut short by the bridge stopping is not an error
+                        log.exception("mirror check failed")
 
         async def post_web_turns(self, found: dict) -> None:
             """Post the turns the user typed in ChatGPT itself to the channel and remember how far we got."""
-            self.state["last_turn_key"] = found["key"]
-            save_json(STATE_FILE, self.state)
             for item in found["items"]:
                 user = (item["user"] or "").strip()
-                self.state["turns_in_chat"] = int(self.state.get("turns_in_chat", 0)) + 1
-                self.streak, self.capped = 0, False  # a human started this turn
                 quote = "\n".join("> " + line for line in user[:800].splitlines() if line.strip())
                 log.info("mirroring a turn typed in ChatGPT (%d chars)", len(item["text"]))
-                await self.post_reply(f"{S('mirror_header')}\n{quote}\n\n{item['text']}", True, item["outputs"])
+                try:
+                    await self.post_reply(f"{S('mirror_header')}\n{quote}\n\n{item['text']}", True, item["outputs"])
+                except Exception:
+                    # The position is saved only after a turn is posted, so the next look tries it again;
+                    # a turn that fails three times is given up, or it would block the ones after it.
+                    key, n = self.web_fail
+                    self.web_fail = (item["key"], n + 1 if key == item["key"] else 1)
+                    if self.web_fail[1] < 3:
+                        raise
+                    log.exception("a web turn could not be posted three times; skipping it")
+                self.state["turns_in_chat"] = int(self.state.get("turns_in_chat", 0)) + 1
+                self.streak, self.capped = 0, False  # a human started this turn
+                self.state["last_turn_key"] = item["key"]
+                save_json(STATE_FILE, self.state)
+            self.state["last_turn_key"] = found["key"]
+            save_json(STATE_FILE, self.state)
             if found["items"]:  # the user is working in ChatGPT right now: look more often for a while
                 self.web_active_until = time.time() + float(self.cfg.get("mirror_fast_for_s", 600))
 
         async def follow_chat(self, url: str) -> None:
             """Make url the bridge's chat: channel messages go there, and its turns get mirrored."""
+            self.switch_chat(url)
+            log.info("following the user to chat %s", url)
+            self.web_active_until = time.time() + float(self.cfg.get("mirror_fast_for_s", 600))
+            await self.note(S("followed_chat", url=url), log_channel=True)
+
+        def switch_chat(self, url: str) -> None:
+            """Point the bridge at another chat, remembering how far the old one was mirrored."""
+            if conv_id(url) == conv_id(self.gpt.chat_url):
+                return
             seen = self.state.setdefault("chat_seen", {})
             seen[conv_id(self.gpt.chat_url)] = self.state.get("last_turn_key")
             while len(seen) > 30:
@@ -1802,18 +1872,18 @@ def make_bridge(cfg: dict, state: dict):
             self.state["intro_sent"] = False  # GPT in that chat has not heard how the group works
             self.state["turns_in_chat"] = 0
             save_json(STATE_FILE, self.state)
-            log.info("following the user to chat %s", url)
-            self.web_active_until = time.time() + float(self.cfg.get("mirror_fast_for_s", 600))
-            await self.note(S("followed_chat", url=url), log_channel=True)
 
-        def requeue(self, batch: str, atts) -> None:
+        def requeue(self, batch: str, atts, newest: int = 0) -> None:
             """Put a batch that did not reach GPT back at the front of the buffer."""
-            self.buffer.insert(0, [None, batch, time.monotonic(), list(atts)])
+            self.buffer.insert(0, [None, batch, time.monotonic(), list(atts), newest])
 
         async def retry_later(self, delay: float) -> None:
             await asyncio.sleep(delay)
             if self.buffer:
-                self.trigger.set()
+                if self.halted:
+                    self.gpt_pending = True  # sent after !resume
+                else:
+                    self.trigger.set()
 
         async def control(self, tag: str, text: str) -> None:
             """A bridge control message to Claude: posted by the GPT bot, starts with the gear emoji."""
@@ -2004,11 +2074,15 @@ def make_bridge(cfg: dict, state: dict):
             log.info("Claude was idle for %d min; stopped it (session %s kept for resume)",
                      (time.time() - last) // 60, f.stem if f is not None else "none")
 
-        async def wake_claude(self, msg) -> None:
+        async def wake_claude(self, msg, text: str | None = None) -> None:
             """Someone @mentioned Claude but its session is not running (PC restarted, crash):
             start it with the ensure script, then hand it the handoff and the message it missed.
             Only active when config claude_watch.ensure_script is set."""
-            if self.waking or not self.cw_ensure or await self.claude_running():
+            if self.waking:  # already starting: hand this message over too, once Claude is up
+                if msg.id not in [m.id for m, _ in self.wake_missed]:
+                    self.wake_missed.append((msg, text))
+                return
+            if not self.cw_ensure or await self.claude_running():
                 return
             if self.cw_paused_until and time.time() < self.cw_paused_until:
                 when = time.strftime("%H:%M", time.localtime(self.cw_paused_until))
@@ -2049,20 +2123,44 @@ def make_bridge(cfg: dict, state: dict):
                 handoff = self.cw_work / "handoff.md"
                 where = f"#{getattr(self.log_channel, 'name', 'log')}" if self.is_log(msg) else f"#{getattr(self.channel, 'name', 'channel')}"
                 await self.control(S("tag_handoff"), S("wake_claude_resumed" if resumed else "wake_claude",
-                                                       handoff=handoff, where=where, text=self.clean(msg)[:600]))
+                                                       handoff=handoff, where=where, text=(text or self.clean(msg))[:600]))
+                await self.flush_missed()
             except Exception:
                 log.exception("waking Claude failed")
             finally:
                 self.waking = False
+                self.wake_missed = []
+
+        async def flush_missed(self) -> None:
+            """Messages that mentioned Claude while it was starting did not reach it: pass them on."""
+            missed, self.wake_missed = self.wake_missed, []
+            if missed:
+                lines = [f"[{self.speaker(m)}] {(t or self.clean(m))[:300]}" for m, t in missed[-5:]]
+                await self.control(S("tag_handoff"), S("missed_claude", text="\n".join(lines)))
 
         async def restart_claude(self) -> None:
             """Fresh Claude session on request: stop the old one, start a new one, hand over."""
+            self.waking = True  # a mention meanwhile must not start a second session; it is handed over after
+            try:
+                await self._restart_claude()
+                await self.flush_missed()
+            finally:
+                self.waking = False
+                self.wake_missed = []
+
+        async def _restart_claude(self) -> None:
             handoff = self.cw_work / "handoff.md"
             await self.note(S("restart_start"), log_channel=True)
             name = self.cw_name.replace("'", "''")
             ps = ("Get-CimInstance Win32_Process | Where-Object { $_.Name -eq 'claude.exe' -and $_.CommandLine -match '--channels' "
                   f"-and $_.CommandLine -match [regex]::Escape('{name}') }} | ForEach-Object {{ Stop-Process -Id $_.ProcessId -Force }}; "
                   "Start-Sleep -Seconds 3; ")
+            if PROFILE is not None:  # the old session's launcher console too: ensure.ps1 counts it as a running Claude
+                prof = str(PROFILE).replace("'", "''")
+                ps += ("Get-CimInstance Win32_Process | Where-Object { $_.Name -match '^(powershell|pwsh)[.]exe$' "
+                       "-and $_.CommandLine -match 'launch-claude[.]ps1' "
+                       f"-and $_.CommandLine.IndexOf('{prof}', [StringComparison]::OrdinalIgnoreCase) -ge 0 }} | "
+                       "ForEach-Object { Stop-Process -Id $_.ProcessId -Force }; ")
             if self.cw_lock:
                 ps += f"Remove-Item '{self.cw_lock}' -ErrorAction SilentlyContinue; "
             self.cw_last_session.unlink(missing_ok=True)  # a fresh session, not a resumed one
@@ -2081,7 +2179,10 @@ def make_bridge(cfg: dict, state: dict):
                 while time.monotonic() - self.last_msg_at < self.cfg["quiet_period_s"]:
                     await asyncio.sleep(0.5)  # wait for the rest of a multi-chunk message
                 self.trigger.clear()
-                batch, atts = self.take_buffer()
+                if self.halted:  # paused by the user: keep the buffer, send after !resume
+                    self.gpt_pending = bool(self.buffer)
+                    continue
+                batch, atts, newest = self.take_buffer()
                 if not batch:
                     continue
                 prompt = batch
@@ -2099,8 +2200,10 @@ def make_bridge(cfg: dict, state: dict):
                             # Turns typed in ChatGPT since the last look come first: after this batch the
                             # bridge's position moves past them, and they would never reach the channel.
                             try:
+                                busy_s = min(float(self.cfg["reply_timeout_s"]), 600)
                                 found = await asyncio.wait_for(
-                                    self.gpt.check_for_web_turns(self.state.get("last_turn_key"), fresh_s=30), 180)
+                                    self.gpt.check_for_web_turns(self.state.get("last_turn_key"), fresh_s=10,
+                                                                 wait_busy_s=busy_s), busy_s + 180)
                                 if found:
                                     await self.post_web_turns(found)
                             except NeedsHuman:
@@ -2127,15 +2230,25 @@ def make_bridge(cfg: dict, state: dict):
                     self.failures = 0
                     self.state.update(intro_sent=True, intro_version=version, last_turn_key=self.gpt.last_key,
                                       turns_in_chat=int(self.state.get("turns_in_chat", 0)) + 1)
+                    if newest:  # a restart re-reads the channel from here
+                        self.state["delivered_msg_id"] = str(max(newest, int(self.state.get("delivered_msg_id") or 0)))
                     save_json(STATE_FILE, self.state)
-                    await self.post_reply(text, finished, outputs, target)
+                    # GPT has answered: from here a failure must not send the batch to GPT again.
+                    for attempt in range(3):
+                        try:
+                            await self.post_reply(text, finished, outputs, target)
+                            break
+                        except Exception:
+                            log.exception("posting GPT's reply failed (try %d)", attempt + 1)
+                            await asyncio.sleep(5 * (attempt + 1))
                 except NeedsHuman as e:
                     log.warning("needs human: %s", e)
-                    self.requeue(batch, atts)
+                    self.requeue(batch, atts, newest)
+                    self.reply_target = self.reply_target or target
                     await self.note(S("needs_human_ask", problem=e))
                 except Exception as e:
                     # Never drop the batch: put it back, then retry (or roll over to a new chat).
-                    self.requeue(batch, atts)
+                    self.requeue(batch, atts, newest)
                     self.reply_target = self.reply_target or target
                     self.failures += 1
                     tries = self.failures
@@ -2211,8 +2324,9 @@ def make_bridge(cfg: dict, state: dict):
                             if e.status != 413:
                                 raise
                             log.warning("upload rejected as too large: %s", [p.name for p in chunk])
-                            await channel.send(((head + "\n\n") if head else "") + self.too_big_text(chunk),
-                                                    suppress_embeds=True)
+                            sent = await channel.send(((head + "\n\n") if head else "") + self.too_big_text(chunk),
+                                                      suppress_embeds=True)
+                            first_msg = first_msg or sent
                 else:
                     sent = await channel.send(part, suppress_embeds=True)
                     first_msg = first_msg or sent
@@ -2220,6 +2334,8 @@ def make_bridge(cfg: dict, state: dict):
                 self.state["last_reply_msg_id"] = str(first_msg.id)
                 self.state["recent_replies"] = (self.state.get("recent_replies", []) + [text[:1500]])[-3:]
                 save_json(STATE_FILE, self.state)
+                if self.cw_wake and f"<@{self.claude_id}>" in text:
+                    self.loop.create_task(self.wake_claude(first_msg, text))  # GPT called a Claude that may be stopped
             self.streak += 1
             log.info("gpt posted %d chars, %d files (streak=%d)", len(text), len(files), self.streak)
 
@@ -2239,14 +2355,24 @@ def make_bridge(cfg: dict, state: dict):
         async def post_reports(self) -> None:
             ch = self.log_channel or self.channel
             now = time.time()
+            for stale in REPORTS_DIR.glob("*.md.sending"):  # the bridge stopped mid-send: send it again
+                if now - stale.stat().st_mtime > 60:
+                    stale.replace(stale.with_name(stale.name[:-len(".sending")]))
             for f in sorted(REPORTS_DIR.glob("*.md"), key=lambda x: x.stat().st_mtime):
+                try:
+                    await self.post_report(f, ch, now)
+                except Exception:  # one bad report must not hold up the ones behind it
+                    log.exception("posting report %s failed", f.name)
+
+        async def post_report(self, f: Path, ch, now: float) -> None:
+            if True:
                 if now - f.stat().st_mtime < 10:
-                    continue  # still being written
+                    return  # still being written
                 text = f.read_text(encoding="utf-8", errors="replace").strip()
                 dest = REPORTS_DIR / "sent" / f"{time.strftime('%Y%m%d-%H%M%S')}-{f.name}"
                 if not text:
                     f.replace(dest)
-                    continue
+                    return
                 first = text.splitlines()[0].lstrip("# ").strip()
                 title = first[:80] if text.startswith("#") else f.stem
                 excerpt = text if len(text) <= REPORT_EXCERPT else text[:REPORT_EXCERPT].rsplit("\n", 1)[0] + "\n..."
@@ -2257,12 +2383,26 @@ def make_bridge(cfg: dict, state: dict):
                 if len(body) > 1990:
                     body = body[:1985] + "\n..."
                 # read into memory: an open handle would block the move below on Windows
-                files = ([discord.File(io.BytesIO(f.read_bytes()), filename=f.name)]
-                         if f.stat().st_size <= self.file_limit() else [])
-                await ch.send(body, files=files, suppress_embeds=True,
-                              allowed_mentions=discord.AllowedMentions(users=[discord.Object(id=self.claude_id)]))
-                f.replace(dest)
+                data = f.read_bytes() if f.stat().st_size <= self.file_limit() else None
+                # Out of the queue before sending, so a failed move afterwards cannot post it every 15 s.
+                sending = f.with_name(f.name + ".sending")
+                f.replace(sending)
+                ping = discord.AllowedMentions(users=[discord.Object(id=self.claude_id)])
+                try:
+                    try:
+                        files = [discord.File(io.BytesIO(data), filename=f.name)] if data is not None else []
+                        sent = await ch.send(body, files=files, suppress_embeds=True, allowed_mentions=ping)
+                    except discord.HTTPException as e:
+                        if e.status != 413 or data is None:
+                            raise
+                        sent = await ch.send(body, suppress_embeds=True, allowed_mentions=ping)  # too large: the text names its path
+                except Exception:
+                    sending.replace(f)  # back in the queue for the next round
+                    raise
+                sending.replace(dest)
                 log.info("posted session report %s (%d chars)", f.name, len(text))
+                if self.cw_wake:
+                    self.loop.create_task(self.wake_claude(sent, body))  # the report is for a Claude that may be stopped
 
         # -- Status board: Claude rewrites data/status.md, the bridge keeps one pinned message in step
         async def status_watch(self) -> None:
@@ -2285,8 +2425,8 @@ def make_bridge(cfg: dict, state: dict):
             content = S("status_head", stamp=time.strftime("%m-%d %H:%M", time.localtime(mtime))) + body
             if len(content) > 1990:
                 content = content[:1950].rsplit("\n", 1)[0] + S("status_cut")
-            self.status_mtime = mtime
             if not body or content == self.state.get("status_text"):
+                self.status_mtime = mtime
                 return
             quiet = discord.AllowedMentions.none()
             msg, mid = None, self.state.get("status_msg_id")
@@ -2297,6 +2437,7 @@ def make_bridge(cfg: dict, state: dict):
                 except discord.NotFound:
                     msg = None  # deleted: post a new one
             if msg is None:
+                self.notes.append(content.strip())
                 msg = await self.channel.send(content, suppress_embeds=True, allowed_mentions=quiet)
                 self.state["status_msg_id"] = str(msg.id)
                 try:
@@ -2304,6 +2445,7 @@ def make_bridge(cfg: dict, state: dict):
                 except discord.HTTPException as e:
                     log.warning("could not pin the status board: %s", e)
                     await self.note(S("pin_failed"))
+            self.status_mtime = mtime  # only now: a failed update is tried again
             self.state["status_text"] = content
             save_json(STATE_FILE, self.state)
             log.info("status board updated (%d chars)", len(content))

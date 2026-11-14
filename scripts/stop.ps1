@@ -12,13 +12,18 @@ param([string]$Profile, [switch]$Restart, [switch]$KeepClaude)
 if (-not $cfg) { exit 1 }
 $flag = Join-Path $data 'stop.flag'
 
-if (Find-Bridge) { New-Item -ItemType File -Force $flag | Out-Null }
-if (-not $KeepClaude) { Find-Claude | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue } }
+$wasRunning = [bool](Find-Bridge)
+if ($wasRunning) { New-Item -ItemType File -Force $flag | Out-Null }
+# /T: with the console that hosts the session and whatever it started
+if (-not $KeepClaude) { Find-Claude | ForEach-Object { & taskkill.exe /PID $_.ProcessId /T /F 2>$null | Out-Null } }
 
 for ($i = 0; $i -lt 30 -and ((Find-Bridge) -or ((-not $KeepClaude) -and (Find-Claude))); $i++) { Start-Sleep -Seconds 1 }
-Find-Bridge | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+# Still there after 30 s: end it with its children (a running Codex turn), or they would be orphaned.
+Find-Bridge | ForEach-Object { & taskkill.exe /PID $_.ProcessId /T /F 2>$null | Out-Null }
 Remove-Item $flag -ErrorAction SilentlyContinue
-Write-Output 'Group chat stopped.'
+if (Find-Bridge) { Write-Output 'The bridge is STILL RUNNING: it could not be stopped.'; exit 1 }
+elseif ($wasRunning) { Write-Output 'Group chat stopped.' }
+else { Write-Output 'No bridge was running for this profile.' }
 
 if ($Restart) {
   Remove-Item (Join-Path $runtime 'ensure.lock') -ErrorAction SilentlyContinue

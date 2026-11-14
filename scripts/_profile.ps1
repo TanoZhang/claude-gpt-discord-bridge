@@ -32,19 +32,28 @@ if ($cfg.claude.name) { $sessionName = $cfg.claude.name }
 if ($cfg.claude_watch.session_name) { $sessionName = $cfg.claude_watch.session_name }
 $bridgeFile = Join-Path $root 'bridge\gpt_bridge.py'
 
+# Does a command line name this path? Case-insensitive, quoted or not, / or \.
+function Test-HasPath([string]$commandLine, [string]$path) {
+  if (-not $commandLine -or -not $path) { return $false }
+  return $commandLine.Replace('/', '\').IndexOf($path.Replace('/', '\'), [StringComparison]::OrdinalIgnoreCase) -ge 0
+}
+
 # This profile's bridge process (not --login / --probe / --check runs).
 function Find-Bridge {
   Get-CimInstance Win32_Process | Where-Object {
-    $_.Name -match '^pythonw?\.exe$' -and $_.CommandLine -and $_.CommandLine.Contains($bridgeFile) -and
+    $_.Name -match '^pythonw?\.exe$' -and (Test-HasPath $_.CommandLine $bridgeFile) -and
     $_.CommandLine -notmatch '--(login|probe|check)' -and
-    $(if ($profilePath) { $_.CommandLine.Contains('"' + $profilePath + '"') } else { $_.CommandLine -notmatch '--profile' })
+    $(if ($profilePath) { Test-HasPath $_.CommandLine $profilePath } else { $_.CommandLine -notmatch '--profile' })
   }
 }
 
-# This profile's Claude channels session, found by its session name.
+# This profile's Claude channels session: claude.exe by its session name, or the launcher
+# that is about to start it (so a second start in those seconds does not make a second session).
 function Find-Claude {
-  Get-CimInstance Win32_Process -Filter "Name='claude.exe'" | Where-Object {
-    $_.CommandLine -match '--channels' -and $_.CommandLine -like ('*' + $sessionName + '*')
+  Get-CimInstance Win32_Process | Where-Object {
+    ($_.Name -eq 'claude.exe' -and $_.CommandLine -match '--channels' -and $_.CommandLine -like ('*' + $sessionName + '*')) -or
+    ($_.Name -match '^(powershell|pwsh)\.exe$' -and $_.CommandLine -match 'launch-claude\.ps1' -and
+      $(if ($profilePath) { Test-HasPath $_.CommandLine $profilePath } else { $_.CommandLine -notmatch '-Profile' }))
   }
 }
 

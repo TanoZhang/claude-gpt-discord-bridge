@@ -124,6 +124,10 @@ class CodexAgent:
         self.outbox = Path(helpers["outbox"])
         self.stopped = False  # the owner stopped the current turn: no retry
         self.closing = False  # the bridge is shutting down
+        self.taken = 0  # buffer entries the running turn took
+        self.seen_ids: set[int] = set()  # Discord messages already observed (live or from catch-up)
+        self.completed = False  # the last run reached turn.completed
+        self.progress = False  # the last run produced at least one item: Codex has seen the prompt
         self.workdir = Path(os.path.expanduser(self.cfg.get("workdir") or "."))
         self.bot_id = int(self.cfg.get("bot_id") or 0)
         self.trigger = asyncio.Event()
@@ -199,19 +203,28 @@ class CodexAgent:
     def remember(self, speaker: str, text: str, attachments=()) -> None:
         buf = self.s["buffer"]
         now = time.time()
-        if buf and buf[-1][0] == speaker and now - buf[-1][2] < 10:
+        # self.taken = how many entries the running turn took; those are deleted when it ends,
+        # so a later chunk must not be appended to them.
+        if buf and len(buf) > self.taken and buf[-1][0] == speaker and now - buf[-1][2] < 10:
             buf[-1][1] += "\n" + text  # one long message split into chunks
             buf[-1][2] = now
         else:
             buf.append([speaker, text, now])
-        del buf[:-200]
+        extra = len(buf) - 200
+        if extra > 0:
+            del buf[:extra]
+            self.taken = max(0, self.taken - extra)
         self.attachments.extend(attachments)
         self.last_msg_at = time.monotonic()
 
     async def observe(self, msg, speaker: str, text: str, may_trigger: bool) -> None:
         """Every channel message except Codex's own goes into Codex's context."""
-        if not self.enabled or self.is_codex(msg):
+        if not self.enabled or self.is_codex(msg) or msg.id in self.seen_ids:
             return
+        if len(self.seen_ids) > 5000:
+            self.seen_ids.clear()
+        self.seen_ids.add(msg.id)
+        self.s["seen_msg_id"] = str(max(msg.id, int(self.s.get("seen_msg_id") or 0)))  # a restart catches up from here
         self.remember(speaker, text, msg.attachments)
         if may_trigger and await self.addressed(msg):
             if self.target_id is None or self.target_id != self.bridge.channel_id:
@@ -219,6 +232,8 @@ class CodexAgent:
             if msg.author.bot and self.bridge.streak >= self.bridge.cap:
                 self.log.info("codex: loop cap hit, not starting")
                 await self.bridge.note(self.S("codex_loop_cap", n=self.bridge.streak))
+                if not self.pending:
+                    self.target_id = None  # or a later request from the other channel would be answered here
                 self.save()
                 return
             self.log.info("codex: requested by %s", speaker)
@@ -257,22 +272,33 @@ class CodexAgent:
             self.pending = False
             target = self.target_id or self.bridge.channel_id
             self.target_id = None
-            n = len(self.s["buffer"])
+            self.taken = len(self.s["buffer"])
             context = self.take_context()
             atts, self.attachments = self.attachments[-10:], []
+            if not self.closing:
+                self.stopped = False
             self.busy = True
             try:
                 await self.run_turn(context, atts, target)
-                del self.s["buffer"][:n]  # what arrived during the turn stays for next time
+                del self.s["buffer"][:self.taken]  # what arrived during the turn stays for next time
             except Exception as e:
+                self.attachments = atts + self.attachments  # they go out again with the next request
                 if self.closing:  # the bridge is stopping mid-turn: the request stays pending for the next start
                     self.log.info("codex: turn interrupted by the bridge stopping; it runs again after the restart")
                     self.s.update(pending=True, target=target)
+                    self.taken = 0
                     self.save()
                     return
-                self.log.exception("codex turn failed")
-                await self.post(target, self.S("codex_failed", err=str(e)[:300]), plain=True)
+                if self.stopped:  # `!codex stop`: the owner already got the answer to that command
+                    self.log.info("codex: turn stopped by the owner")
+                else:
+                    self.log.exception("codex turn failed")
+                    try:
+                        await self.post(target, self.S("codex_failed", err=str(e)[:300]), plain=True)
+                    except Exception:  # Discord trouble must not end this worker: nobody would run Codex again
+                        self.log.exception("codex: could not post the failure notice")
             finally:
+                self.taken = 0
                 self.busy = False
                 self.process = None
                 if not self.closing and not self.pending:
@@ -355,7 +381,12 @@ class CodexAgent:
                 break
             lines.append(raw.decode("utf-8", "replace").rstrip("\r\n"))
         await proc.wait()
-        err = await err_task
+        try:  # a grandchild that inherited the pipe could keep it open after Codex is gone
+            err = await asyncio.wait_for(err_task, 15)
+        except asyncio.TimeoutError:
+            err = b""
+        self.completed = any('"type":"turn.completed"' in line.replace(" ", "") for line in lines)
+        self.progress = any('"type":"item.' in line.replace(" ", "") for line in lines)
         journal = self.outbox.parent / "codex-runs"
         journal.mkdir(parents=True, exist_ok=True)
         (journal / f"{time.strftime('%Y%m%d-%H%M%S')}.jsonl").write_text("\n".join(lines), encoding="utf-8")
@@ -365,6 +396,8 @@ class CodexAgent:
             error = timed_out
         elif proc.returncode and not error:
             error = (stderr.splitlines() or [f"exit code {proc.returncode}"])[-1]
+        elif not self.completed and not error:
+            error = "the run ended before Codex finished its turn"
         return new_thread, messages, error, stderr
 
     async def kill(self) -> None:
@@ -391,7 +424,8 @@ class CodexAgent:
         if thread and int(self.s.get("turns", 0)) >= int(self.cfg.get("rotate_turns", 40)):
             self.log.info("codex: %s turns in thread, starting a new one", self.s.get("turns"))
             thread = None
-        self.stopped = False
+        if self.stopped or self.closing:  # stopped while the attachments were downloading
+            raise RuntimeError("stopped")
         tries = 1 + max(0, int(self.cfg.get("retries", 1)))
         async with self.typing(target):
             prompt = self.build_prompt(context, files, target, fresh=not thread)
@@ -405,7 +439,8 @@ class CodexAgent:
                 if new_thread and new_thread != thread:
                     self.s.update(thread=new_thread, turns=0)
                     thread = new_thread
-                if messages or not error or self.stopped or LIMIT_RE.search(error) or attempt == tries - 1:
+                failed = bool(error) and not (messages and self.completed)
+                if not failed or self.stopped or LIMIT_RE.search(error) or attempt == tries - 1:
                     break
                 # One automatic retry. If the failed run got as far as a thread, that thread already
                 # holds the whole prompt: continue it with one line instead of sending it all again.
@@ -413,9 +448,9 @@ class CodexAgent:
                 await asyncio.sleep(20)
                 if self.stopped:
                     break
-                if new_thread:
+                if new_thread and self.progress:
                     prompt = self.S("codex_continue", err=error[:200])
-        if error and not messages:
+        if error and not (messages and self.completed):
             if LIMIT_RE.search(error):
                 raise RuntimeError(self.S("codex_limit", err=error[:200]))
             raise RuntimeError(error[:300])
@@ -469,9 +504,10 @@ class CodexAgent:
             channel = self.bridge.get_channel(channel_id) or self.bridge.channel
             prefix = "**[Codex]** "
         mentions = discord.AllowedMentions(everyone=False, roles=False, users=True, replied_user=False)
-        parts = self.split_message(prefix + text) or [""]
+        parts = self.split_message(text) or [""]
         if len(parts) > 1:
             parts = [f"{p}\n({i + 1}/{len(parts)})" for i, p in enumerate(parts)]
+        parts = [prefix + p for p in parts]
         for i, part in enumerate(parts):
             last = i == len(parts) - 1
             if last and files:
