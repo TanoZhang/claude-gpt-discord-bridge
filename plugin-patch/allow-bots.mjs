@@ -130,6 +130,22 @@ const PERM_T = {
   },
 }
 
+// Other wording: DISCORD_PERMISSION_WORDING holds JSON with any of head, useTool, purpose,
+// chars, edits (templates with {what} {tool} {name} {s} {n}) and actions (tool -> phrase).
+// scripts/launch-claude.ps1 passes the config's claude.permission_wording.
+try {
+  const w = JSON.parse(process.env.DISCORD_PERMISSION_WORDING || 'null')
+  if (w && typeof w === 'object') {
+    const fill = (t, v) => String(t).replace(/\{(\w+)\}/g, (m, k) => (k in v ? v[k] : m))
+    if (w.head) PERM_T.head = (what, tool) => fill(w.head, { what, tool })
+    if (w.useTool) PERM_T.useTool = (name) => fill(w.useTool, { name })
+    if (w.purpose) PERM_T.purpose = (s) => fill(w.purpose, { s })
+    if (w.chars) PERM_T.chars = (n) => fill(w.chars, { n })
+    if (w.edits) PERM_T.edits = (n) => fill(w.edits, { n })
+    if (w.actions && typeof w.actions === 'object') Object.assign(PERM_T.actions, w.actions)
+  }
+} catch {}
+
 const clip = (s, n) => { s = String(s ?? ''); return s.length > n ? s.slice(0, n) + '…' : s }
 const fence = (s, lang = '') => '```' + lang + '\n' + String(s).replace(/```/g, '`​``') + '\n```'
 const inline = (s) => '`' + String(s).replace(/`/g, "'") + '`'

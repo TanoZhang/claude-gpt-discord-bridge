@@ -16,6 +16,9 @@ config.json:
     "network": true,                  network access inside workspace-write
     "context_max_chars": 20000,
     "rotate_turns": 40,               start a new Codex thread after this many turns
+    "stall_timeout_s": 1800,          stop a run that produced no event for this long (0 = never)
+    "turn_timeout_s": 10800,          stop a run that takes longer than this in total (0 = never)
+    "retries": 1,                     automatic retries of a failed run (not for usage limits)
     "intro": "..."                    optional; sent at the start of each Codex thread
   }
 Owner commands: !codex status | !codex stop | !codex new
@@ -114,6 +117,7 @@ class CodexAgent:
         self.S = helpers["S"]  # the bridge's string lookup: S("key", **values)
         self.root = Path(helpers["root"])
         self.outbox = Path(helpers["outbox"])
+        self.stopped = False  # the owner stopped the current turn: no retry
         self.workdir = Path(os.path.expanduser(self.cfg.get("workdir") or "."))
         self.bot_id = int(self.cfg.get("bot_id") or 0)
         self.trigger = asyncio.Event()
@@ -148,10 +152,14 @@ class CodexAgent:
             self.poster = None
             self.log.warning("codex: bot login failed, replies go through GPT: %s", e)
         asyncio.get_running_loop().create_task(self.worker())
+        if self.s.get("pending"):  # asked just before the bridge stopped: do it now
+            self.log.info("codex: a request from before the restart is pending")
+            self.pending, self.target_id = True, self.s.get("target")
+            self.trigger.set()
 
     async def close(self) -> None:
-        if self.process and self.process.returncode is None:
-            self.process.kill()
+        self.stopped = True
+        await self.kill()
         if self.poster:
             try:
                 await self.poster.close()
@@ -209,6 +217,7 @@ class CodexAgent:
                 return
             self.log.info("codex: requested by %s", speaker)
             self.pending = True
+            self.s.update(pending=True, target=self.target_id)  # survives a bridge restart
             self.trigger.set()
         self.save()
 
@@ -242,6 +251,8 @@ class CodexAgent:
             self.pending = False
             target = self.target_id or self.bridge.channel_id
             self.target_id = None
+            self.s.pop("pending", None)
+            self.s.pop("target", None)
             n = len(self.s["buffer"])
             context = self.take_context()
             atts, self.attachments = self.attachments[-10:], []
@@ -290,16 +301,66 @@ class CodexAgent:
         self.process = await asyncio.create_subprocess_exec(
             *self.command_args(thread), stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE, cwd=str(self.workdir), creationflags=NO_WINDOW, limit=16 * 1024 * 1024)
-        out, err = await self.process.communicate(prompt.encode("utf-8"))
-        lines = out.decode("utf-8", "replace").splitlines()
+        proc = self.process
+        proc.stdin.write(prompt.encode("utf-8"))
+        await proc.stdin.drain()
+        proc.stdin.close()
+        # Read the event stream as it comes, so a hung run is noticed: no event for stall_timeout_s
+        # (one long shell command is silent meanwhile, so keep it generous) or the whole turn over
+        # turn_timeout_s stops the process. 0 turns a limit off.
+        stall = float(self.cfg.get("stall_timeout_s", 1800))
+        total = float(self.cfg.get("turn_timeout_s", 10800))
+        started, lines, timed_out = time.monotonic(), [], None
+        err_task = asyncio.create_task(proc.stderr.read())
+        while True:
+            wait = stall if stall > 0 else None
+            if total > 0:
+                left = total - (time.monotonic() - started)
+                wait = left if wait is None else min(wait, left)
+            try:
+                if wait is not None and wait <= 0:
+                    raise asyncio.TimeoutError
+                raw = await asyncio.wait_for(proc.stdout.readline(), wait)
+            except asyncio.TimeoutError:
+                over = total > 0 and time.monotonic() - started >= total
+                timed_out = (self.S("codex_timeout", min=int(total // 60)) if over
+                             else self.S("codex_stalled", min=int(stall // 60)))
+                self.log.warning("codex: %s; stopping the process", timed_out)
+                await self.kill()
+                break
+            except ValueError:  # one event longer than the stream limit
+                continue
+            if not raw:
+                break
+            lines.append(raw.decode("utf-8", "replace").rstrip("\r\n"))
+        await proc.wait()
+        err = await err_task
         journal = self.outbox.parent / "codex-runs"
         journal.mkdir(parents=True, exist_ok=True)
         (journal / f"{time.strftime('%Y%m%d-%H%M%S')}.jsonl").write_text("\n".join(lines), encoding="utf-8")
         new_thread, messages, error = parse_events(lines)
         stderr = err.decode("utf-8", "replace").strip()
-        if self.process.returncode and not error:
-            error = (stderr.splitlines() or [f"exit code {self.process.returncode}"])[-1]
+        if timed_out:
+            error = timed_out
+        elif proc.returncode and not error:
+            error = (stderr.splitlines() or [f"exit code {proc.returncode}"])[-1]
         return new_thread, messages, error, stderr
+
+    async def kill(self) -> None:
+        """Stop the Codex process and everything it started (shells, test runs)."""
+        proc = self.process
+        if proc is None or proc.returncode is not None:
+            return
+        try:
+            if os.name == "nt":
+                k = await asyncio.create_subprocess_exec(
+                    "taskkill.exe", "/PID", str(proc.pid), "/T", "/F", stdout=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.DEVNULL, creationflags=NO_WINDOW)
+                await k.wait()
+            if proc.returncode is None:
+                proc.kill()
+        except (OSError, ProcessLookupError):
+            pass
 
     async def run_turn(self, context: str, atts: list, target: int) -> None:
         files, failed = await self.bridge.download(atts) if atts else ([], [])
@@ -309,16 +370,30 @@ class CodexAgent:
         if thread and int(self.s.get("turns", 0)) >= int(self.cfg.get("rotate_turns", 40)):
             self.log.info("codex: %s turns in thread, starting a new one", self.s.get("turns"))
             thread = None
+        self.stopped = False
+        tries = 1 + max(0, int(self.cfg.get("retries", 1)))
         async with self.typing(target):
             prompt = self.build_prompt(context, files, target, fresh=not thread)
-            new_thread, messages, error, stderr = await self.exec_codex(prompt, thread)
-            if thread and error and not messages and re.search(r"not found|no (such )?(session|thread|rollout)", error + stderr, re.I):
-                self.log.warning("codex: thread %s cannot be resumed (%s); starting a new one", thread, error)
-                thread = None
-                prompt = self.build_prompt(context, files, target, fresh=True)
-                new_thread, messages, error, stderr = await self.exec_codex(prompt, None)
-        if new_thread and new_thread != thread:
-            self.s.update(thread=new_thread, turns=0)
+            for attempt in range(tries):
+                new_thread, messages, error, stderr = await self.exec_codex(prompt, thread)
+                if thread and error and not messages and re.search(r"not found|no (such )?(session|thread|rollout)", error + stderr, re.I):
+                    self.log.warning("codex: thread %s cannot be resumed (%s); starting a new one", thread, error)
+                    thread = None
+                    prompt = self.build_prompt(context, files, target, fresh=True)
+                    new_thread, messages, error, stderr = await self.exec_codex(prompt, None)
+                if new_thread and new_thread != thread:
+                    self.s.update(thread=new_thread, turns=0)
+                    thread = new_thread
+                if messages or not error or self.stopped or LIMIT_RE.search(error) or attempt == tries - 1:
+                    break
+                # One automatic retry. If the failed run got as far as a thread, that thread already
+                # holds the whole prompt: continue it with one line instead of sending it all again.
+                self.log.warning("codex: turn failed (%s); retrying in 20 s", error[:200])
+                await asyncio.sleep(20)
+                if self.stopped:
+                    break
+                if new_thread:
+                    prompt = self.S("codex_continue", err=error[:200])
         if error and not messages:
             if LIMIT_RE.search(error):
                 raise RuntimeError(self.S("codex_limit", err=error[:200]))
@@ -392,8 +467,9 @@ class CodexAgent:
         S = self.S
         cmd = (arg.split() or ["status"])[0].lower()
         if cmd == "stop":
-            if self.process and self.process.returncode is None:
-                self.process.kill()
+            if self.busy:
+                self.stopped = True  # also ends a pending retry
+                await self.kill()
                 return S("codex_stopped")
             return S("codex_not_running")
         if cmd == "new":

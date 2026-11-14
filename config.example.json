@@ -16,7 +16,7 @@
     "prompt_template": "prompts/claude-prompt.md"
   },
 
-  "claude_watch": { "ctx_limit": 150000, "ensure_script": "" },
+  "claude_watch": { "ctx_limit": 150000, "ensure_script": "", "wake_on_mention": false, "idle_stop_min": 0 },
   "permissions_in_channel": true,
   "max_file_mb": null,
 
@@ -43,7 +43,10 @@
     "sandbox": "workspace-write",
     "network": true,
     "context_max_chars": 20000,
-    "rotate_turns": 40
+    "rotate_turns": 40,
+    "stall_timeout_s": 1800,
+    "turn_timeout_s": 10800,
+    "retries": 1
   },
 
   "strings": {}

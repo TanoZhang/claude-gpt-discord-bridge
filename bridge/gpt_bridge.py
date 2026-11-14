@@ -38,11 +38,17 @@ Files (repository root):
   data/stop.flag     create it to make the bridge exit cleanly
 The channel's allowlist is shared with the Claude plugin: access.json
 groups[<channel>].allowFrom (default ~/.claude/channels/discord/access.json).
+
+Several projects from one copy of the code: add `--profile <file-or-folder>` to any of the
+commands above. The profile is the config; its runtime_dir / data_dir say where that
+project's state, browser profile, logs and handoff files live (see use_profile).
+`--profile <p> --check` prints the resolved paths and starts nothing.
 """
 from __future__ import annotations
 
 import argparse
 import asyncio
+import collections
 import io
 import json
 import logging
@@ -63,6 +69,56 @@ LOG_DIR = DATA / "logs"
 STOP_FLAG = DATA / "stop.flag"
 LOCK_FILE = DATA / "bridge.lock"
 ACCESS_FILE = Path.home() / ".claude" / "channels" / "discord" / "access.json"  # config: access_file
+RUNTIME = DATA           # files shared with Claude: handoff.md, restart.request, status.md, reports/
+PROFILE: Path | None = None  # set by --profile
+
+
+def use_profile(arg: str) -> None:
+    """Run from a profile instead of the repository root, so one copy of the code serves
+    several projects. `arg` is a JSON file (the config itself) or a folder holding config.json.
+
+    Keys read here (all optional):
+      runtime_dir     files shared with Claude and the launcher: handoff.md, restart.request,
+                      status.md, reports/, logs/claude-run.log, gpt-bot.env, access.json.
+                      Default: the folder itself, or data/<profile name> for a file.
+      data_dir        the bridge's own files: state.json, chrome-profile/, logs/, inbox/,
+                      outbox/, stop.flag, bridge.lock. Default: <runtime_dir>/bridge.
+      gpt_token_file  default <runtime_dir>/gpt-bot.env, else gpt-bot.env in the repository root.
+      access_file     default <runtime_dir>/access.json if it exists, else the plugin's own.
+    """
+    global PROFILE, CONFIG_FILE, RUNTIME, DATA, TOKEN_FILE, STATE_FILE, PROFILE_DIR, LOG_DIR
+    global STOP_FLAG, LOCK_FILE, ACCESS_FILE, INBOX_DIR, OUTBOX_DIR, REPORTS_DIR, STATUS_FILE
+    p = Path(os.path.expanduser(arg)).resolve()
+    if p.is_dir():
+        PROFILE, CONFIG_FILE, default_runtime = p, p / "config.json", p
+    else:
+        PROFILE, CONFIG_FILE, default_runtime = p, p, ROOT / "data" / p.stem
+    if not CONFIG_FILE.is_file():
+        raise SystemExit(f"profile not found: {CONFIG_FILE}")
+    try:
+        raw = json.loads(CONFIG_FILE.read_text(encoding="utf-8-sig"))
+    except ValueError as e:
+        raise SystemExit(f"profile {CONFIG_FILE} is not valid JSON: {e}")
+
+    def path(key: str, default: Path) -> Path:
+        return Path(os.path.expanduser(raw[key])).resolve() if raw.get(key) else default
+
+    RUNTIME = path("runtime_dir", default_runtime)
+    DATA = path("data_dir", RUNTIME / "bridge")
+    TOKEN_FILE = path("gpt_token_file", RUNTIME / "gpt-bot.env")
+    if not raw.get("gpt_token_file") and not TOKEN_FILE.exists():
+        TOKEN_FILE = ROOT / "gpt-bot.env"
+    if (RUNTIME / "access.json").exists():
+        ACCESS_FILE = RUNTIME / "access.json"
+    STATE_FILE = DATA / "state.json"
+    PROFILE_DIR = DATA / "chrome-profile"
+    LOG_DIR = DATA / "logs"
+    STOP_FLAG = DATA / "stop.flag"
+    LOCK_FILE = DATA / "bridge.lock"
+    INBOX_DIR = DATA / "inbox"
+    OUTBOX_DIR = DATA / "outbox"
+    REPORTS_DIR = RUNTIME / "reports"
+    STATUS_FILE = RUNTIME / "status.md"
 
 # Every message the bridge itself writes. Override any of them in config.json "strings".
 DEFAULT_STRINGS = {
@@ -128,6 +184,9 @@ DEFAULT_STRINGS = {
     "codex_failed": "(Codex did not finish this time: {err}. The messages are kept; the next @Codex sends them again.)",
     "codex_limit": "Codex usage or rate limit reached: {err}",
     "codex_empty": "(Codex returned nothing.)",
+    "codex_stalled": "Codex produced nothing for {min} min and was stopped",
+    "codex_timeout": "Codex ran longer than {min} min and was stopped",
+    "codex_continue": "[The previous run was cut off: {err}] Continue the same task from where it stopped; do not start over. Check what is already done first.",
     "codex_too_big": "(These files are over Discord's upload limit and were not sent: {files})",
     "codex_recent_header": "[Your most recent replies in the previous session]",
     "codex_context_header": "[Group chat messages since your last reply]",
@@ -141,6 +200,12 @@ DEFAULT_STRINGS = {
     "codex_status": "Codex: {state}; session {session}, {turns} turns so far; {pending} messages waiting for it; posting as {poster}.",
     "codex_running": "running", "codex_idle": "idle", "codex_new_session": "(new)",
     "codex_poster_bot": "the Codex bot", "codex_poster_gpt": "the GPT bot (Codex bot not logged in)",
+    "fresh_words": "fresh",  # `!gpt new <word>`: space-separated words that mean "no handoff summary"
+    "tag_pause": "[Pause]", "tag_resume": "[Resume]", "tag_limit_over": "[Limit over]",
+    "tag_context": "[Context]", "tag_handoff": "[Handoff]",
+    "claude_login_expired": "⚠️ Claude's login has expired, so it cannot answer. Run `claude` in a terminal, enter `/login`, then @Claude again. GPT and Codex are not affected.",
+    "claude_not_logged_in": "⚠️ Claude started but is not logged in, so it cannot answer. Run `claude` in a terminal, enter `/login`, then @Claude again. GPT and Codex are not affected.",
+    "wake_claude_resumed": "You were stopped while idle and have just been resumed in the same session. Answer the user's message in {where} (you did not receive it): \"{text}\"",
     "pin_failed": "(I could not pin this status message: the GPT bot lacks the Pin Messages permission. Pin it once by hand.)",
 }
 STR = dict(DEFAULT_STRINGS)
@@ -195,6 +260,11 @@ def save_json(path: Path, data) -> None:
 
 def load_config() -> dict:
     cfg = load_json(CONFIG_FILE, {})
+    if cfg.get("strings_file"):  # shared wording for several profiles; "strings" still wins
+        shared = Path(os.path.expanduser(cfg["strings_file"]))
+        if not shared.is_absolute():
+            shared = CONFIG_FILE.parent / shared
+        STR.update(load_json(shared, {}))
     cfg.setdefault("loop_cap", 4)
     cfg.setdefault("reply_timeout_s", 900)
     cfg.setdefault("first_token_timeout_s", 120)
@@ -660,6 +730,7 @@ def squash(s: str) -> str:
 
 
 LIMIT_RE = re.compile(r"hit your (session |5-hour |weekly )?limit|usage limit|limit reached|out of (extra )?usage", re.I)
+LOGIN_RE = re.compile(r"login expired|please run /login|not logged in|invalid api key|oauth token", re.I)
 RESET_RE = re.compile(r"resets\s+(?:at\s+)?(\d{1,2})(?::(\d{2}))?\s*(am|pm)?(?:\s*\(([^)]+)\))?", re.I)
 
 
@@ -1156,6 +1227,7 @@ def make_bridge(cfg: dict, state: dict):
             self.status_mtime = None
             self.follow_candidate = None  # a newer chat of the project, seen once
             self.waking = False  # a wake-up of Claude is in progress
+            self.notes = collections.deque(maxlen=50)  # the bridge's own notices: status lines, not conversation
             self.archive_dir = Path(os.path.expanduser(cfg["archive_dir"])) if cfg.get("archive_dir") else None
             self.archive_lock = asyncio.Lock()
             # Claude watcher
@@ -1165,14 +1237,24 @@ def make_bridge(cfg: dict, state: dict):
             if c.get("workdir"):
                 w.setdefault("project_dir", str(Path.home() / ".claude" / "projects" / re.sub(r"[^A-Za-z0-9]", "-", c["workdir"])))
             w.setdefault("session_name", c.get("name", "Group Claude"))
-            w.setdefault("work_dir", str(DATA))
-            w.setdefault("ensure_script", str(ROOT / "scripts" / "ensure.ps1"))
-            w.setdefault("lock_file", str(DATA / "ensure.lock"))
+            self.cw_wake = self.cw_wake or bool(w.get("wake_on_mention"))
+            w.setdefault("work_dir", str(RUNTIME))
+            w.setdefault("lock_file", str(RUNTIME / "ensure.lock"))
             self.cw_dir = Path(os.path.expanduser(w["project_dir"])) if w.get("project_dir") else None
             self.cw_name = w.get("session_name", "")
             self.cw_ctx_limit = int(w.get("ctx_limit", 150000))
             self.cw_work = Path(os.path.expanduser(w["work_dir"]))
-            self.cw_ensure = os.path.expanduser(w.get("ensure_script", ""))
+            # How to start this project's Claude session: the configured script, else scripts/ensure.ps1
+            # (with this profile). Single-quoted for PowerShell.
+            if w.get("ensure_script"):
+                self.cw_ensure = "& '" + os.path.expanduser(w["ensure_script"]).replace("'", "''") + "'"
+            else:
+                self.cw_ensure = "& '" + str(ROOT / "scripts" / "ensure.ps1").replace("'", "''") + "'"
+                if PROFILE is not None:
+                    self.cw_ensure += " -Profile '" + str(PROFILE).replace("'", "''") + "'"
+            self.cw_idle_s = float(w.get("idle_stop_min", 0)) * 60  # 0 = never stop an idle Claude
+            self.cw_idle_checked = time.time()
+            self.cw_last_session = self.cw_work / "claude-last-session.txt"  # written at an idle stop; the launcher resumes it
             self.cw_lock = os.path.expanduser(w.get("lock_file", ""))
             self.cw_file: Path | None = None
             self.cw_offset = 0
@@ -1181,6 +1263,7 @@ def make_bridge(cfg: dict, state: dict):
             self.cw_nudged_at = 0.0
             self.cw_paused_until: float | None = None
             self.cw_limit_text = ""
+            self.cw_login_noted = 0.0
             # Codex CLI as a group member (optional, config "codex")
             self.codex = None
             if cfg.get("codex", {}).get("enabled"):
@@ -1188,7 +1271,7 @@ def make_bridge(cfg: dict, state: dict):
                 from codex_agent import CodexAgent
                 self.codex = CodexAgent(self, discord, cfg, state, lambda: save_json(STATE_FILE, self.state), log,
                                         {"split_message": split_message, "fence_tables": fence_tables,
-                                         "outbox": OUTBOX_DIR, "root": ROOT, "S": S})
+                                         "outbox": OUTBOX_DIR, "root": ROOT if PROFILE is None else RUNTIME, "S": S})
 
         # -- helpers
         @property
@@ -1242,6 +1325,20 @@ def make_bridge(cfg: dict, state: dict):
             for a in msg.attachments:
                 text += "\n" + S("attachment", name=a.filename)
             return text.strip()
+
+        def mentions_claude(self, msg) -> bool:
+            """@Claude as a user mention, as its role (Discord's picker offers the bot's
+            role next to the bot itself, and the two look the same), or as plain text."""
+            if any(u.id == self.claude_id for u in msg.mentions):
+                return True
+            for r in msg.role_mentions:
+                if (getattr(getattr(r, "tags", None), "bot_id", None) == self.claude_id
+                        or re.fullmatch(r"(bot)?claude", r.name.strip(), re.I)):
+                    return True
+            known = {int(x) for x in self.cfg.get("claude_role_ids", [])}
+            if known.intersection(getattr(msg, "raw_role_mentions", [])):
+                return True  # role cache can be empty without the Guilds intent
+            return bool(re.search(r"@(bot)?claude\b", msg.content or "", re.I))
 
         async def addressed_to_gpt(self, msg) -> bool:
             me = self.user
@@ -1309,6 +1406,7 @@ def make_bridge(cfg: dict, state: dict):
             try:
                 ch = (self.log_channel or self.channel) if log_channel else self.channel
                 if ch:
+                    self.notes.append(text.strip())  # before sending: the gateway event can beat the HTTP reply
                     await ch.send(text, allowed_mentions=discord.AllowedMentions.none(), suppress_embeds=True)
             except Exception as e:
                 log.warning("note failed: %s", e)
@@ -1475,7 +1573,7 @@ def make_bridge(cfg: dict, state: dict):
             if (self.cw_wake and self.in_channel(msg)
                     and ((not msg.author.bot and msg.author.id in self.humans())
                          or (self.codex is not None and self.codex.is_codex(msg)))
-                    and (any(u.id == self.claude_id for u in msg.mentions) or re.search(r"@(bot)?claude\b", msg.content or "", re.I))):
+                    and self.mentions_claude(msg)):
                 self.loop.create_task(self.wake_claude(msg))
             if self.codex and self.codex.enabled and self.user is not None and self.in_channel(msg):
                 try:
@@ -1491,8 +1589,8 @@ def make_bridge(cfg: dict, state: dict):
             """Feed Codex the channel like GPT gets it; the owner, Claude and GPT may call it."""
             content = (msg.content or "").strip()
             if msg.author.id == self.user.id:
-                if content.startswith(("**[Codex]**", "\u2699")):
-                    return  # Codex's fallback posts and bridge control messages
+                if content.startswith(("**[Codex]**", "\u2699")) or content in self.notes:
+                    return  # Codex's fallback posts, bridge control messages and bridge notices
                 speaker = "GPT"
             elif msg.author.id == self.claude_id:
                 speaker = S("claude_label")
@@ -1567,7 +1665,7 @@ def make_bridge(cfg: dict, state: dict):
                 save_json(STATE_FILE, self.state)
                 await self.note(S("url_set"))
             elif cmd == "new":
-                fresh = len(parts) > 1 and parts[1].lower() == "fresh"
+                fresh = len(parts) > 1 and parts[1].lower() in S("fresh_words").lower().split()
                 try:
                     async with self.page_lock, self.channel.typing():
                         await self.rollover(handoff=not fresh, reason=S("reason_manual"))
@@ -1721,7 +1819,7 @@ def make_bridge(cfg: dict, state: dict):
             self.state["halted"] = self.halted
             save_json(STATE_FILE, self.state)
             log.info("halted by the user")
-            await self.control("[Pause]", S("halt_claude"))
+            await self.control(S("tag_pause"), S("halt_claude"))
             await self.note(S("halt_done"))
 
         async def resume(self) -> None:
@@ -1732,7 +1830,7 @@ def make_bridge(cfg: dict, state: dict):
             self.state.pop("halted", None)
             save_json(STATE_FILE, self.state)
             log.info("resumed by the user")
-            await self.control("[Resume]", S("resume_claude"))
+            await self.control(S("tag_resume"), S("resume_claude"))
             await self.note(S("resume_done"))
             if self.codex:
                 self.codex.resume()
@@ -1815,15 +1913,23 @@ def make_bridge(cfg: dict, state: dict):
                     when = time.strftime("%H:%M", time.localtime(self.cw_paused_until))
                     log.warning("Claude hit its usage limit: %s", self.cw_limit_text)
                     await self.note(S("claude_limit", text=self.cw_limit_text, when=when))
+                if ((e.get("isApiErrorMessage") or msg.get("model") == "<synthetic>") and LOGIN_RE.search(text)
+                        and time.time() - self.cw_login_noted > 3600):  # once an hour, not per message
+                    self.cw_login_noted = time.time()
+                    log.warning("Claude cannot answer: %s", text.strip()[:200])
+                    await self.note(S("claude_login_expired"))
             now = time.time()
+            if self.cw_idle_s and now - self.cw_idle_checked >= 300:
+                self.cw_idle_checked = now
+                await self.stop_idle_claude()
             if self.cw_paused_until and now >= self.cw_paused_until + 60:
                 self.cw_paused_until = None
-                await self.control("[Limit over]", S("limit_over_claude"))
+                await self.control(S("tag_limit_over"), S("limit_over_claude"))
             if (self.cw_ctx > self.cw_ctx_limit and now - self.cw_nudged_at > 7200
                     and not self.halted and not self.cw_paused_until):
                 self.cw_nudged_at = now
                 handoff, restart = self.cw_work / "handoff.md", self.cw_work / "restart.request"
-                await self.control("[Context]", S("ctx_claude", k=self.cw_ctx // 1000, handoff=handoff, restart=restart))
+                await self.control(S("tag_context"), S("ctx_claude", k=self.cw_ctx // 1000, handoff=handoff, restart=restart))
 
         async def claude_running(self) -> bool:
             name = (self.cw_name or "").replace("'", "''")  # only this project's session counts
@@ -1837,6 +1943,53 @@ def make_bridge(cfg: dict, state: dict):
                 return int(out.decode().strip() or 0) > 0
             except ValueError:
                 return True  # unsure: do not start a second one
+
+        async def stop_idle_claude(self) -> None:
+            """Stop this project's Claude session after claude_watch.idle_stop_min minutes without
+            activity (saves memory, like the idle browser). The session id is kept, so the next
+            @Claude resumes the same conversation. A shell or script still running under Claude
+            counts as work in progress."""
+            if self.waking or self.halted or (self.cw_work / "restart.request").exists():
+                return
+            name = (self.cw_name or "").replace("'", "''")
+            ps = ("$all = Get-CimInstance Win32_Process; "
+                  "$c = @($all | Where-Object { $_.Name -eq 'claude.exe' -and $_.CommandLine -match '--channels' "
+                  "-and $_.CommandLine -like '*" + name + "*' }); "
+                  "if (-not $c) { 'none'; exit }; "
+                  "$started = ($c | ForEach-Object { $_.CreationDate } | Sort-Object | Select-Object -First 1); "
+                  "$ids = @($c | ForEach-Object { $_.ProcessId }); $busy = 0; "
+                  "for ($d = 0; $d -lt 4 -and $ids; $d++) { "
+                  "$kids = @($all | Where-Object { $ids -contains $_.ParentProcessId }); "
+                  "if ($kids | Where-Object { $_.Name -match '^(bash|sh|cmd|powershell|pwsh|python|pythonw|py)\\.exe$' "
+                  "-and $_.CommandLine -notmatch 'mcp|plugin' }) { $busy = 1; break }; "
+                  "$ids = @($kids | ForEach-Object { $_.ProcessId }) }; "
+                  "'{0} {1} {2}' -f ([DateTimeOffset]$started).ToUnixTimeSeconds(), $busy, "
+                  "(($c | ForEach-Object { $_.ProcessId }) -join ',')")
+            proc = await asyncio.create_subprocess_exec(
+                "powershell.exe", "-NoProfile", "-Command", ps, stdout=asyncio.subprocess.PIPE,
+                creationflags=0x08000000)
+            out, _ = await proc.communicate()
+            fields = out.decode(errors="replace").split()
+            if len(fields) != 3 or not fields[0].isdigit():
+                return  # not running, or unsure
+            started, busy, pids = float(fields[0]), fields[1] == "1", [x for x in fields[2].split(",") if x.isdigit()]
+            last = started
+            f = self._cw_find()
+            if f is not None and f.stat().st_mtime > started:  # a fresh session has no transcript until its first message
+                last = f.stat().st_mtime
+            else:
+                f = None
+            if busy or time.time() - last < self.cw_idle_s:
+                return
+            if f is not None:
+                self.cw_last_session.write_text(f.stem, encoding="utf-8")
+            for pid in pids:
+                kill = await asyncio.create_subprocess_exec(
+                    "taskkill.exe", "/PID", pid, "/T", "/F", stdout=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.DEVNULL, creationflags=0x08000000)
+                await kill.wait()
+            log.info("Claude was idle for %d min; stopped it (session %s kept for resume)",
+                     (time.time() - last) // 60, f.stem if f is not None else "none")
 
         async def wake_claude(self, msg) -> None:
             """Someone @mentioned Claude but its session is not running (PC restarted, crash):
@@ -1855,7 +2008,13 @@ def make_bridge(cfg: dict, state: dict):
                 ps = ""
                 if self.cw_lock:
                     ps += f"Remove-Item '{self.cw_lock}' -ErrorAction SilentlyContinue; "
-                ps += f"& '{self.cw_ensure}'"
+                ps += self.cw_ensure
+                resumed = False  # stopped while idle: the launcher continues that session
+                try:
+                    last = self.cw_last_session.read_text(encoding="utf-8").strip()
+                    resumed = bool(last and self.cw_dir and (self.cw_dir / f"{last}.jsonl").exists())
+                except OSError:
+                    pass
                 proc = await asyncio.create_subprocess_exec("powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass",
                                                             "-Command", ps, creationflags=0x08000000)
                 await proc.wait()
@@ -1863,10 +2022,21 @@ def make_bridge(cfg: dict, state: dict):
                 if not await self.claude_running():
                     await self.note(S("claude_wake_failed"))
                     return
+                try:  # a logged-out CLI stays open at its prompt and never answers
+                    run_log = self.cw_work / "logs" / "claude-run.log"
+                    tail = run_log.read_bytes()[-20000:].decode("utf-8", "replace") if run_log.exists() else ""
+                    tail = tail.rsplit("transcript start", 1)[-1]  # this launch only; the log is appended to
+                except OSError:
+                    tail = ""
+                if re.search(r"not logged in|run /login", tail, re.I):
+                    log.warning("Claude started but is not logged in")
+                    await self.note(S("claude_not_logged_in"))
+                    return
                 self.cw_file, self.cw_ctx, self.cw_nudged_at = None, 0, time.time()
                 handoff = self.cw_work / "handoff.md"
                 where = f"#{getattr(self.log_channel, 'name', 'log')}" if self.is_log(msg) else f"#{getattr(self.channel, 'name', 'channel')}"
-                await self.control("[Handoff]", S("wake_claude", handoff=handoff, where=where, text=self.clean(msg)[:600]))
+                await self.control(S("tag_handoff"), S("wake_claude_resumed" if resumed else "wake_claude",
+                                                       handoff=handoff, where=where, text=self.clean(msg)[:600]))
             except Exception:
                 log.exception("waking Claude failed")
             finally:
@@ -1882,13 +2052,13 @@ def make_bridge(cfg: dict, state: dict):
                   "Start-Sleep -Seconds 3; ")
             if self.cw_lock:
                 ps += f"Remove-Item '{self.cw_lock}' -ErrorAction SilentlyContinue; "
-            if self.cw_ensure:
-                ps += f"& '{self.cw_ensure}'"
+            self.cw_last_session.unlink(missing_ok=True)  # a fresh session, not a resumed one
+            ps += self.cw_ensure
             proc = await asyncio.create_subprocess_exec("powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps)
             await proc.wait()
             self.cw_file, self.cw_ctx, self.cw_nudged_at = None, 0, time.time()
             await asyncio.sleep(45)  # the new session needs a moment to connect to Discord
-            await self.control("[Handoff]", S("handoff_claude", handoff=handoff))
+            await self.control(S("tag_handoff"), S("handoff_claude", handoff=handoff))
             log.info("Claude restarted as a fresh session")
 
         async def worker(self) -> None:
@@ -2190,11 +2360,76 @@ async def run_probe(cfg: dict, state: dict) -> None:
         await gpt.shutdown()
 
 
+def run_check() -> None:
+    """Dry check of a profile: what would be used and what is missing. Starts no browser and
+    no Discord connection; it only tries the single-instance lock to see if a bridge is running."""
+    cfg = load_config()
+    codex = cfg.get("codex", {})
+    codex_token = Path(os.path.expanduser(codex["token_file"])) if codex.get("token_file") else (ROOT if PROFILE is None else RUNTIME) / "codex-bot.env"
+    w = cfg.get("claude_watch", {})
+    rows = [
+        ("config", CONFIG_FILE, CONFIG_FILE.is_file()),
+        ("runtime_dir", RUNTIME, RUNTIME.is_dir()),
+        ("data_dir", DATA, DATA.is_dir()),
+        ("state", STATE_FILE, STATE_FILE.is_file()),
+        ("chrome profile", PROFILE_DIR, PROFILE_DIR.is_dir()),
+        ("gpt token file", TOKEN_FILE, TOKEN_FILE.is_file()),
+        ("access file", Path(os.path.expanduser(cfg.get("access_file") or str(ACCESS_FILE))), None),
+        ("handoff", RUNTIME / "handoff.md", None),
+        ("status", STATUS_FILE, None),
+        ("reports", REPORTS_DIR, None),
+    ]
+    if codex.get("enabled"):
+        rows += [("codex token file", codex_token, codex_token.is_file()),
+                 ("codex workdir", Path(os.path.expanduser(codex.get("workdir") or ".")), None)]
+    ok = True
+    for name, p, must in rows:
+        exists = p.exists()
+        if must is not None and not exists and name not in ("state", "data_dir", "chrome profile"):
+            ok = False  # state, data folder and browser profile are created on first use
+        print(f"{name:17} {'ok     ' if exists else 'MISSING'} {p}")
+    for key in ("channel_id", "owner_id", "claude_bot_id"):
+        if not str(cfg.get(key, "")).isdigit():
+            ok = False
+            print(f"config key {key} is missing or not a number")
+    unknown = sorted(set(STR) - set(DEFAULT_STRINGS))
+    if unknown:
+        print("unknown strings (ignored):", ", ".join(unknown))
+    for key, text in STR.items():
+        try:
+            text.format(**{n: "x" for n in re.findall(r"{(\w+)}", text)})
+            want = set(re.findall(r"{(\w+)}", DEFAULT_STRINGS.get(key, "")))
+            extra = set(re.findall(r"{(\w+)}", text)) - want
+            if extra:
+                ok = False
+                print(f"string {key} uses unknown placeholders: {', '.join(sorted(extra))}")
+        except Exception as e:
+            ok = False
+            print(f"string {key} does not format: {e}")
+    print(f"channel {cfg.get('channel_id')} log {cfg.get('log_channel_id') or '-'}; session \"{w.get('session_name') or cfg.get('claude', {}).get('name', '')}\"; "
+          f"codex {'on' if codex.get('enabled') else 'off'}; idle stop {w.get('idle_stop_min', 0)} min; "
+          f"wake on mention {bool(w.get('ensure_script') or w.get('wake_on_mention'))}; archive {cfg.get('archive_dir') or '-'}")
+    lock = acquire_lock() if DATA.is_dir() else "free"
+    print("bridge lock:", "free" if lock else "HELD (a bridge is running on this profile)")
+    if lock and lock != "free":
+        os.close(lock)
+    print("CHECK OK" if ok else "CHECK FAILED")
+    if not ok:
+        raise SystemExit(1)
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--login", action="store_true")
     ap.add_argument("--probe", action="store_true")
+    ap.add_argument("--profile", help="a profile JSON file, or a folder holding config.json (default: config.json in the repository root)")
+    ap.add_argument("--check", action="store_true", help="print the resolved paths and settings, start nothing")
     a = ap.parse_args()
+    if a.profile:
+        use_profile(a.profile)
+    if a.check:
+        run_check()
+        return
     setup_logging(console=a.login or a.probe)
     cfg, state = load_config(), load_json(STATE_FILE, {})
 

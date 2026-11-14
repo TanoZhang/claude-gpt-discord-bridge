@@ -172,3 +172,16 @@ Owner commands: `!codex status`, `!codex stop` (kill the current turn), `!codex 
 Built by [TanoZhang](https://github.com/TanoZhang) with **[Claude Code](https://claude.com/claude-code)**. The code, scripts and this README were written by Claude (Anthropic, Claude Opus 5.5) in a pair-programming session. Commits carry a `Co-Authored-By: Claude` trailer.
 
 MIT licensed.
+
+## Several projects from one copy
+
+Give each project its own profile: a JSON file with the same keys as `config.json`, plus where its files live.
+
+```json
+{ "runtime_dir": "~/bridge-data/project-a", "channel_id": "...", "claude": { "workdir": "C:\\work\\project-a", "name": "Project A Claude" } }
+```
+
+- `runtime_dir` holds what Claude and the launcher share (handoff.md, restart.request, status.md, reports/, gpt-bot.env, logs/claude-run.log); `data_dir` (default `<runtime_dir>/bridge`) holds the bridge's own state, browser profile and logs. `gpt_token_file` and `strings_file` (wording shared by several profiles) are optional.
+- Every command takes the profile: `python bridge/gpt_bridge.py --profile a.json [--login|--probe|--check]`, `scripts\ensure.ps1 -Profile a.json [-BridgeOnly]`, `scripts\stop.ps1 -Profile a.json [-Restart] [-KeepClaude]`. `--check` prints the resolved paths and starts nothing.
+- `claude_watch.wake_on_mention: true` starts the Claude session when someone @mentions it (start the bridge alone with `-BridgeOnly`); `claude_watch.idle_stop_min` stops an idle Claude session and resumes the same conversation at the next mention.
+- Codex runs are stopped after `codex.stall_timeout_s` without output or `codex.turn_timeout_s` in total, and a failed run is retried `codex.retries` times, continuing its thread when there is one.
