@@ -46,7 +46,9 @@
     "rotate_turns": 40,
     "stall_timeout_s": 1800,
     "turn_timeout_s": 10800,
-    "retries": 1
+    "retries": 1,
+    "model": "",
+    "disable_features": []
   },
 
   "strings": {}

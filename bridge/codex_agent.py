@@ -19,6 +19,11 @@ config.json:
     "stall_timeout_s": 1800,          stop a run that produced no event for this long (0 = never)
     "turn_timeout_s": 10800,          stop a run that takes longer than this in total (0 = never)
     "retries": 1,                     automatic retries of a failed run (not for usage limits)
+    "model": "",                      optional; default is the model in ~/.codex/config.toml
+    "disable_features": [],           Codex feature flags to turn off for these runs (`codex features list`),
+                                      e.g. ["apps", "plugins", "computer_use", "browser_use", "image_generation",
+                                      "multi_agent", "goals", "realtime_conversation"]: a smaller fixed context
+    "config_overrides": [],           extra `-c key=value` settings
     "intro": "..."                    optional; sent at the start of each Codex thread
   }
 Owner commands: !codex status | !codex stop | !codex new
@@ -118,6 +123,7 @@ class CodexAgent:
         self.root = Path(helpers["root"])
         self.outbox = Path(helpers["outbox"])
         self.stopped = False  # the owner stopped the current turn: no retry
+        self.closing = False  # the bridge is shutting down
         self.workdir = Path(os.path.expanduser(self.cfg.get("workdir") or "."))
         self.bot_id = int(self.cfg.get("bot_id") or 0)
         self.trigger = asyncio.Event()
@@ -158,7 +164,7 @@ class CodexAgent:
             self.trigger.set()
 
     async def close(self) -> None:
-        self.stopped = True
+        self.stopped = self.closing = True
         await self.kill()
         if self.poster:
             try:
@@ -251,8 +257,6 @@ class CodexAgent:
             self.pending = False
             target = self.target_id or self.bridge.channel_id
             self.target_id = None
-            self.s.pop("pending", None)
-            self.s.pop("target", None)
             n = len(self.s["buffer"])
             context = self.take_context()
             atts, self.attachments = self.attachments[-10:], []
@@ -261,11 +265,19 @@ class CodexAgent:
                 await self.run_turn(context, atts, target)
                 del self.s["buffer"][:n]  # what arrived during the turn stays for next time
             except Exception as e:
+                if self.closing:  # the bridge is stopping mid-turn: the request stays pending for the next start
+                    self.log.info("codex: turn interrupted by the bridge stopping; it runs again after the restart")
+                    self.s.update(pending=True, target=target)
+                    self.save()
+                    return
                 self.log.exception("codex turn failed")
                 await self.post(target, self.S("codex_failed", err=str(e)[:300]), plain=True)
             finally:
                 self.busy = False
                 self.process = None
+                if not self.closing and not self.pending:
+                    self.s.pop("pending", None)
+                    self.s.pop("target", None)
                 self.save()
 
     def build_prompt(self, context: str, files: list[Path], target: int, fresh: bool) -> str:
@@ -288,6 +300,15 @@ class CodexAgent:
     def command_args(self, thread: str | None) -> list[str]:
         sandbox = self.cfg.get("sandbox", "workspace-write")
         args = [find_codex(self.cfg.get("executable")), "-a", "never", "-s", sandbox, "-C", str(self.workdir)]
+        if self.cfg.get("model"):
+            args += ["-m", str(self.cfg["model"])]
+        # Each feature brings tool descriptions that are sent with every model call. A group
+        # member that edits code and runs commands needs few of them: turning the rest off
+        # cut the fixed context by about a third (codex-cli 0.167).
+        for feature in self.cfg.get("disable_features", []):
+            args += ["--disable", str(feature)]
+        for override in self.cfg.get("config_overrides", []):
+            args += ["-c", str(override)]
         if sandbox == "workspace-write" and self.cfg.get("network", True):
             args += ["-c", "sandbox_workspace_write.network_access=true"]
         args += ["exec"]
