@@ -22,6 +22,8 @@
 
   "loop_cap": 4,
   "mirror_interval_s": 60,
+  "mirror_fast_s": 0,
+  "mirror_fast_for_s": 600,
   "rollover_turns": 40,
   "browser_idle_close_s": 180,
   "archive_dir": "",

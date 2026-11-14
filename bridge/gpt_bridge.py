@@ -887,7 +887,7 @@ class ChatGPT:
         url = url or self.chat_url
         await self.page.goto(url, wait_until="domcontentloaded", timeout=60_000)
         await self.wait_composer()
-        self.last_used = time.monotonic()
+        self.last_used = self.loaded_at = time.monotonic()
 
     async def wait_composer(self, timeout_s: float = 45) -> None:
         end = time.monotonic() + timeout_s
@@ -1060,15 +1060,18 @@ class ChatGPT:
             log.exception("collecting reply files failed")
             return []
 
-    async def check_for_web_turns(self, seen_key: str | None) -> dict | None:
+    async def check_for_web_turns(self, seen_key: str | None, fresh_s: float = 0) -> dict | None:
         """Reload the chat and return {key, items} for the turns after seen_key: items are the
         finished turns typed in ChatGPT itself, [{user, text, outputs}], oldest first; key is the
         newest finished turn. A turn still being answered is left for the next look. Turns the
-        bridge sent (they start with a [speaker] tag) are skipped. Returns None when nothing is new."""
+        bridge sent (they start with a [speaker] tag) are skipped. Returns None when nothing is new.
+        A page loaded less than fresh_s ago is not loaded again."""
         if self.crashed or not self.alive():
             await self.start()  # the browser is closed while idle; a check opens it again
         self.last_used = time.monotonic()
-        await self.open_chat()
+        if not (fresh_s and time.monotonic() - getattr(self, "loaded_at", 0.0) < fresh_s
+                and conv_id(self.page.url) == conv_id(self.chat_url)):
+            await self.open_chat()
         turn = await self.last_turn()
         for _ in range(15):  # turns render a moment after the composer appears
             if turn["key"] and turn["state"] is not None:
@@ -1227,6 +1230,7 @@ def make_bridge(cfg: dict, state: dict):
             self.status_mtime = None
             self.follow_candidate = None  # a newer chat of the project, seen once
             self.waking = False  # a wake-up of Claude is in progress
+            self.web_active_until = 0.0  # until then the web mirror looks every mirror_fast_s
             self.notes = collections.deque(maxlen=50)  # the bridge's own notices: status lines, not conversation
             self.archive_dir = Path(os.path.expanduser(cfg["archive_dir"])) if cfg.get("archive_dir") else None
             self.archive_lock = asyncio.Lock()
@@ -1733,8 +1737,10 @@ def make_bridge(cfg: dict, state: dict):
             if interval <= 0:
                 return
             fails = 0  # page-load failures in a row: back off so a throttled account is not hammered
+            fast = int(self.cfg.get("mirror_fast_s", 0))  # the interval while the user is active in ChatGPT; 0 = no fast mode
             while not self.is_closed():
-                await asyncio.sleep(min(interval * (2 ** min(fails, 4)), 3600))
+                step = fast if fast > 0 and not fails and time.time() < self.web_active_until else interval
+                await asyncio.sleep(min(step * (2 ** min(fails, 4)), 3600))
                 if self.busy or self.page_lock.locked() or self.trigger.is_set() or self.channel is None:
                     continue
                 if time.time() < self.gpt.throttled_until:
@@ -1753,15 +1759,7 @@ def make_bridge(cfg: dict, state: dict):
                         self.gpt.crashed = True
                         continue
                     if found:
-                        self.state["last_turn_key"] = found["key"]
-                        save_json(STATE_FILE, self.state)
-                        for item in found["items"]:
-                            user = (item["user"] or "").strip()
-                            self.state["turns_in_chat"] = int(self.state.get("turns_in_chat", 0)) + 1
-                            self.streak, self.capped = 0, False  # a human started this turn
-                            quote = "\n".join("> " + line for line in user[:800].splitlines() if line.strip())
-                            log.info("mirroring a turn typed in ChatGPT (%d chars)", len(item["text"]))
-                            await self.post_reply(f"{S('mirror_header')}\n{quote}\n\n{item['text']}", True, item["outputs"])
+                        await self.post_web_turns(found)
                     # The user went on in another chat of the project: follow them there. Seen as the
                     # newest chat on two looks in a row, so one odd sidebar render does not move us.
                     if newest and conv_id(newest) != conv_id(self.gpt.chat_url):
@@ -1779,6 +1777,20 @@ def make_bridge(cfg: dict, state: dict):
                 except Exception:
                     log.exception("mirror check failed")
 
+        async def post_web_turns(self, found: dict) -> None:
+            """Post the turns the user typed in ChatGPT itself to the channel and remember how far we got."""
+            self.state["last_turn_key"] = found["key"]
+            save_json(STATE_FILE, self.state)
+            for item in found["items"]:
+                user = (item["user"] or "").strip()
+                self.state["turns_in_chat"] = int(self.state.get("turns_in_chat", 0)) + 1
+                self.streak, self.capped = 0, False  # a human started this turn
+                quote = "\n".join("> " + line for line in user[:800].splitlines() if line.strip())
+                log.info("mirroring a turn typed in ChatGPT (%d chars)", len(item["text"]))
+                await self.post_reply(f"{S('mirror_header')}\n{quote}\n\n{item['text']}", True, item["outputs"])
+            if found["items"]:  # the user is working in ChatGPT right now: look more often for a while
+                self.web_active_until = time.time() + float(self.cfg.get("mirror_fast_for_s", 600))
+
         async def follow_chat(self, url: str) -> None:
             """Make url the bridge's chat: channel messages go there, and its turns get mirrored."""
             seen = self.state.setdefault("chat_seen", {})
@@ -1791,6 +1803,7 @@ def make_bridge(cfg: dict, state: dict):
             self.state["turns_in_chat"] = 0
             save_json(STATE_FILE, self.state)
             log.info("following the user to chat %s", url)
+            self.web_active_until = time.time() + float(self.cfg.get("mirror_fast_for_s", 600))
             await self.note(S("followed_chat", url=url), log_channel=True)
 
         def requeue(self, batch: str, atts) -> None:
@@ -2082,6 +2095,18 @@ def make_bridge(cfg: dict, state: dict):
                     if self.channel is None:
                         self.channel = await self.fetch_channel(self.channel_id)
                     async with self.page_lock, self.channel.typing():
+                        if int(self.cfg.get("mirror_interval_s", 0)) > 0:
+                            # Turns typed in ChatGPT since the last look come first: after this batch the
+                            # bridge's position moves past them, and they would never reach the channel.
+                            try:
+                                found = await asyncio.wait_for(
+                                    self.gpt.check_for_web_turns(self.state.get("last_turn_key"), fresh_s=30), 180)
+                                if found:
+                                    await self.post_web_turns(found)
+                            except NeedsHuman:
+                                raise
+                            except Exception:
+                                log.exception("looking for web turns before sending failed")
                         limit = int(self.cfg.get("rollover_turns", 0))
                         if limit and int(self.state.get("turns_in_chat", 0)) >= limit:
                             await self.rollover(handoff=True, reason=S("reason_auto", n=limit))
