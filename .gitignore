@@ -10,3 +10,12 @@ data/
 .venv/
 __pycache__/
 *.pyc
+
+# private to this machine (never pushed)
+profiles/
+old/
+README.zh-local.md
+*.vbs
+*.lnk
+*.bak-*
+plugin-patch/patch.log
