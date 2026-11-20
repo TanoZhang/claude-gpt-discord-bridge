@@ -120,6 +120,159 @@ async def test_web_turns(tmp: Path) -> None:
     await b.post_web_turns(found)  # the next look finds the same turns again
     check("web turns: both turns posted on the next look", len(b.channel.sent) == 2, str(len(b.channel.sent)))
     check("web turns: position ends at the newest turn", b.state["last_turn_key"] == "k3")
+    b.state["last_turn_key"] = "k0"  # the page showed an older turn last, so the same turns look new again
+    await b.post_web_turns(found)
+    check("web turns: a posted turn is never posted again", len(b.channel.sent) == 2, str(len(b.channel.sent)))
+    await b.close()
+
+
+async def test_mirror_rules(tmp: Path) -> None:
+    """A web turn is posted once, only when it is new since the last look, and never empty."""
+    T = lambda k, text="a", user="q", state="complete": {"key": k, "state": state, "userText": user, "text": text}
+    new, late, first = gb.pick_web_turns([T("a"), T("b"), T("c")], set())
+    check("mirror: a chat with no turn seen before is all history", first and not new and not late)
+    new, late, first = gb.pick_web_turns([T("a"), T("b"), T("c")], {"b"})
+    check("mirror: only turns after the newest seen one are news", [t["key"] for t in new] == ["c"] and late == ["a"] and not first)
+    new, late, first = gb.pick_web_turns([T("a"), T("b")], {"a", "b", "zz"})
+    check("mirror: a page that ends at a seen turn has no news", not new and not late and not first)
+    new, late, first = gb.pick_web_turns([T("a"), T("p"), T("b")], {"a", "b"}, {"p"})
+    check("mirror: a turn that was waiting stays news after the bridge's own turn", [t["key"] for t in new] == ["p"] and not late)
+
+    b = make_bridge(tmp, mirror_interval_s=60)
+    g = b.gpt
+    g.page = FakePage(url=g.chat_url or "https://chatgpt.com/c/aaaaaaaa-0000-0000-0000-000000000001")
+    page = {"turns": [], "last": {}, "copied": None, "outputs": []}
+
+    async def fake_open_chat(url=None):
+        g.last_used = g.loaded_at = time.monotonic()
+
+    async def fake_last_turn():
+        t = page["turns"][-1]
+        return {"key": t["key"], "state": t["state"], "count": len(page["turns"]), "userText": t["userText"],
+                "text": t["text"], "fallback": "", **page["last"]}
+
+    async def fake_turns():
+        return [dict(t) for t in page["turns"]]
+
+    async def fake_copied():
+        return page["copied"]
+
+    async def fake_outputs():
+        return list(page["outputs"])
+
+    async def fast_sleep(s, _real=asyncio.sleep):
+        await _real(0)
+
+    g.open_chat, g.last_turn, g.page_turns = fake_open_chat, fake_last_turn, fake_turns
+    g.copied_reply, g.outputs_of_last_turn = fake_copied, fake_outputs
+    g.alive = lambda: True
+    b.channel = FakeChannel()
+    b.cw_wake = False
+    real_sleep, gb.asyncio.sleep = gb.asyncio.sleep, fast_sleep
+    try:
+        async def look(name="periodic"):
+            found = await g.check_for_web_turns(b.mirrored())
+            if found:
+                await b.post_web_turns(found, name)
+            return found
+
+        # First look at a chat: history is recorded, nothing is posted.
+        b.state.pop("mirrored_keys", None)
+        b.state["last_turn_key"] = ""
+        page["turns"] = [T("h1"), T("h2"), T("h3")]
+        await look()
+        check("mirror: the first look at a chat posts nothing", len(b.channel.sent) == 0, str(b.channel.sent))
+        check("mirror: the first look records every turn", {"h1", "h2", "h3"} <= b.mirrored(), str(b.mirrored()))
+        await look()
+        check("mirror: the second look posts nothing either", len(b.channel.sent) == 0)
+
+        # The saved position is not on the page (it showed fewer turns): the last turn is not posted.
+        b.state["last_turn_key"] = "gone"
+        page["turns"] = [T("h1"), T("h2")]
+        await look()
+        check("mirror: a lost position does not post the last turn", len(b.channel.sent) == 0)
+
+        # An old turn the page had not shown before appears in the middle: history.
+        page["turns"] = [T("h1"), T("old"), T("h2"), T("h3")]
+        await look()
+        await look()
+        check("mirror: an old turn that appears late is not posted", len(b.channel.sent) == 0 and "old" in b.mirrored())
+
+        # A new turn is posted once, also when the page later ends at an older turn and comes back.
+        page["turns"] = [T("h1"), T("old"), T("h2"), T("h3"), T("n1", "answer one", "question one")]
+        await look()
+        check("mirror: a new turn is posted", len(b.channel.sent) == 1 and "answer one" in b.channel.sent[0])
+        page["turns"] = page["turns"][:-1]
+        await look()
+        page["turns"].append(T("n1", "answer one", "question one"))
+        await look()
+        check("mirror: a posted turn is not posted again", len(b.channel.sent) == 1, str(len(b.channel.sent)))
+
+        # A turn the bridge sent is recorded, not posted.
+        page["turns"].append(T("own", "reply", "[Tano] hello"))
+        await look()
+        check("mirror: the bridge's own turn is not posted", len(b.channel.sent) == 1 and "own" in b.mirrored())
+
+        # A finished last turn without a reply waits, then is given up without a post.
+        page["turns"].append(T("blank", "", "what now"))
+        for _ in range(gb.WEB_BLANK_LOOKS - 1):
+            await look()
+        check("mirror: an empty reply is not posted and not recorded while it may load",
+              len(b.channel.sent) == 1 and "blank" not in b.mirrored())
+        page["turns"][-1]["text"] = "late answer"
+        await look()
+        check("mirror: the reply is posted once it is there", len(b.channel.sent) == 2 and "late answer" in b.channel.sent[1])
+
+        page["turns"].append(T("blank2", "", "and now"))
+        for _ in range(gb.WEB_BLANK_LOOKS):
+            await look()
+        check("mirror: a reply that stays empty is given up without a post",
+              len(b.channel.sent) == 2 and "blank2" in b.mirrored(), str(len(b.channel.sent)))
+
+        # A turn that was waiting is still posted after the bridge's own turn came after it.
+        page["turns"].append(T("wait", "", "slow one"))
+        await look()
+        page["turns"][-1]["text"] = "slow answer"
+        page["turns"].append(T("own2", "reply", "[Tano] next"))
+        b.mark_seen(["own2"])
+        await look()
+        check("mirror: a waiting turn is posted after the bridge's own turn", len(b.channel.sent) == 3
+              and "slow answer" in b.channel.sent[2], str(len(b.channel.sent)))
+
+        # No Copy button on the last turn: it may be unfinished; wait, then post what is there.
+        page["last"] = {"copy": 0}
+        page["turns"].append(T("part", "half an answer", "long one"))
+        await look()
+        check("mirror: a reply without its Copy button waits", len(b.channel.sent) == 3)
+        page["last"] = {"copy": 1}
+        page["copied"] = "the whole answer"
+        await look()
+        check("mirror: the finished reply is posted whole", len(b.channel.sent) == 4 and "the whole answer" in b.channel.sent[3])
+        page["copied"] = None
+
+        # A turn still being answered is left alone.
+        page["turns"].append(T("busy", "so far", "thinking", state="streaming"))
+        await look()
+        check("mirror: a turn still being answered is not posted", len(b.channel.sent) == 4 and "busy" not in b.mirrored())
+        page["turns"][-1].update(state="complete", text="done now")
+        await look()
+        check("mirror: it is posted when finished", len(b.channel.sent) == 5 and "done now" in b.channel.sent[4])
+
+        # Another chat, never looked at: history only; a turn typed there afterwards is news.
+        b.switch_chat("https://chatgpt.com/c/bbbbbbbb-0000-0000-0000-000000000002")
+        g.page = FakePage(url=g.chat_url)
+        page["turns"] = [T("x1"), T("x2"), T("x3")]
+        await look()
+        check("mirror: a chat followed for the first time posts none of its turns", len(b.channel.sent) == 5, str(len(b.channel.sent)))
+        page["turns"].append(T("x4", "fresh", "new question"))
+        await look()
+        check("mirror: a turn typed there afterwards is posted", len(b.channel.sent) == 6 and "fresh" in b.channel.sent[5])
+
+        # post_web_turns itself never posts an empty reply.
+        await b.post_web_turns({"key": "e1", "items": [{"key": "e1", "user": "q", "text": " ", "outputs": []}], "seen": ["s9"]})
+        check("mirror: an empty item is never posted", len(b.channel.sent) == 6 and {"e1", "s9"} <= b.mirrored())
+    finally:
+        gb.asyncio.sleep = real_sleep
     await b.close()
 
 
@@ -146,6 +299,119 @@ async def test_reports(tmp: Path) -> None:
 
 
 # ------------------------------------------------------------------ Codex
+
+# ------------------------------------------------------------------ page loads and rate limits
+
+class FakeLocator:
+    first = None
+
+    def __init__(self):
+        self.first = self
+
+    async def is_visible(self):
+        return False
+
+
+class FakePage:
+    def __init__(self, url="https://chatgpt.com/c/aaaaaaaa-0000-0000-0000-000000000001", title="ChatGPT"):
+        self.url, self._title = url, title
+
+    def locator(self, sel):
+        return FakeLocator()
+
+    async def title(self):
+        return self._title
+
+    async def evaluate(self, *a):
+        return ""
+
+    def is_closed(self):
+        return False
+
+
+async def test_page_loads(tmp: Path) -> None:
+    b = make_bridge(tmp, mirror_interval_s=60)
+    g = b.gpt
+
+    # No input box and no login page: not the user's job.
+    g.page = FakePage()
+    try:
+        await g.wait_composer(timeout_s=0.2)
+        check("page: no input box raises", False)
+    except gb.PageNotLoaded:
+        check("page: a page without input box and without login is PageNotLoaded", True)
+    except gb.NeedsHuman:
+        check("page: a page without input box and without login is PageNotLoaded", False, "NeedsHuman")
+    g.page = FakePage(url="https://auth.openai.com/log-in")
+    try:
+        await g.wait_composer(timeout_s=0.2)
+        check("page: a login page raises", False)
+    except gb.NeedsHuman:
+        check("page: a login page still needs the user", True)
+    except gb.PageNotLoaded:
+        check("page: a login page still needs the user", False, "PageNotLoaded")
+
+    # A look that has to start the browser loads the chat once, not twice.
+    loads = []
+    g.page = None
+
+    async def fake_open_chat(url=None):
+        loads.append(url)
+        g.last_used = g.loaded_at = time.monotonic()
+
+    async def fake_start(mode=None):
+        g.page = FakePage()
+        await fake_open_chat()
+
+    async def fake_last_turn():
+        return {"key": "k1", "state": g.sel["turn_done"], "count": 1, "userText": "", "text": ""}
+
+    async def fake_page_turns():
+        return [{"key": "k1", "state": g.sel["turn_done"], "userText": "", "text": ""}]
+
+    g.open_chat, g.start, g.last_turn, g.page_turns = fake_open_chat, fake_start, fake_last_turn, fake_page_turns
+    await g.check_for_web_turns({"k1"})
+    check("page: a look that starts the browser loads the chat once", len(loads) == 1, str(len(loads)))
+    g.loaded_at -= 100
+    await g.check_for_web_turns({"k1"})
+    check("page: a look on an open, old page reloads it", len(loads) == 2, str(len(loads)))
+
+    # The worker keeps the batch and tries again by itself; the user is not asked.
+    b.channel = FakeChannel()
+    delays = []
+
+    async def no_wait():
+        return None
+
+    async def fake_retry(delay):
+        delays.append(delay)
+
+    async def not_loaded(*a, **kw):
+        raise gb.PageNotLoaded(gb.S("problem_no_composer"))
+
+    b.wait_until_ready, b.retry_later, g.check_for_web_turns = no_wait, fake_retry, not_loaded
+    worker = asyncio.create_task(b.worker())
+    for n in range(gb.PAGE_FAILS_NOTE):
+        if n == 0:
+            b.remember("User", "@GPT hello", (), 900)
+        b.trigger.set()
+        for _ in range(100):
+            await asyncio.sleep(0.02)
+            if len(delays) > n:
+                break
+        if n == 0:
+            check("page: nothing is posted for the first failed load", not b.channel.sent, str(b.channel.sent))
+    worker.cancel()
+    check("page: the batch is kept", any("hello" in e[1] for e in b.buffer))
+    check("page: every failed load schedules a retry", len(delays) == gb.PAGE_FAILS_NOTE, str(delays))
+    check("page: retries come later each time", delays == sorted(delays) and delays[0] < delays[-1], str(delays))
+    ask = gb.S("needs_human_ask", problem=gb.S("problem_no_composer"))
+    check("page: the user is not asked to open the browser", ask not in b.channel.sent, str(b.channel.sent))
+    check("page: one note says the bridge is retrying", len(b.channel.sent) == 1, str(b.channel.sent))
+    g.throttled_until = time.time() + 200
+    check("page: a retry waits past the rate limit window", b.page_retry_delay(1) > 200, str(b.page_retry_delay(1)))
+    await b.close()
+
 
 class FakeMsg:
     def __init__(self, mid, author_id=10, bot=False, channel_id=1, content="@Codex do it"):
@@ -288,7 +554,7 @@ async def main() -> None:
     logging.basicConfig(level=logging.CRITICAL)
     with tempfile.TemporaryDirectory() as t:
         tmp = Path(t)
-        for i, test in enumerate((test_buffer, test_halt, test_web_turns, test_reports, test_codex_buffer, test_codex_runs)):
+        for i, test in enumerate((test_buffer, test_halt, test_web_turns, test_mirror_rules, test_page_loads, test_reports, test_codex_buffer, test_codex_runs)):
             d = tmp / str(i)
             d.mkdir()
             try:

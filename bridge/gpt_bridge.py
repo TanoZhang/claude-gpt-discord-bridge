@@ -58,6 +58,7 @@ import re
 import sys
 import time
 from pathlib import Path
+from urllib.parse import urlsplit
 
 ROOT = Path(__file__).resolve().parent.parent
 DATA = ROOT / "data"
@@ -173,6 +174,7 @@ DEFAULT_STRINGS = {
     "problem_check": "ChatGPT is showing a human check",
     "problem_login": "ChatGPT needs you to log in",
     "problem_no_composer": "ChatGPT did not load (no input box found)",
+    "page_retrying": "{problem}, probably rate limited; the message is kept and I keep trying on my own. Nothing to do.",
     "report_head": "\U0001f4e5 [report] <@{claude}> A report from another session: **{title}** ({n} chars)\nFull text: `{path}`\n\n",
     "status_head": "\U0001f4cc **Status** (updated by Claude {stamp})\n\n",
     "status_cut": "\n... (too long, the rest is cut)",
@@ -205,6 +207,8 @@ DEFAULT_STRINGS = {
     "tag_context": "[Context]", "tag_handoff": "[Handoff]",
     "claude_login_expired": "⚠️ Claude's login has expired, so it cannot answer. Run `claude` in a terminal, enter `/login`, then @Claude again. GPT and Codex are not affected.",
     "claude_not_logged_in": "⚠️ Claude started but is not logged in, so it cannot answer. Run `claude` in a terminal, enter `/login`, then @Claude again. GPT and Codex are not affected.",
+    "claude_stuck_startup": "⚠️ Claude was started but never came up: it is waiting at a startup question in its hidden window, so it receives nothing. Its screen shows:\n```\n{screen}\n```\nAnswer it on the computer (or settle what it asks), then restart this project's bridge. GPT and Codex are not affected.",
+    "claude_stuck_unknown": "⚠️ Claude was started but never came up (its Discord plugin is not running), so it receives nothing. Its screen could not be read; restart this project's bridge on the computer. GPT and Codex are not affected.",
     "missed_claude": "While you were starting, these messages mentioned you. You may not have received them; answer the ones you have not answered:\n{text}",
     "wake_claude_resumed": "You were stopped while idle and have just been resumed in the same session. Answer the user's message in {where} (you did not receive it): \"{text}\"",
     "pin_failed": "(I could not pin this status message: the GPT bot lacks the Pin Messages permission. Pin it once by hand.)",
@@ -585,13 +589,16 @@ LAST_TURN_JS = r"""
     fallback = (clone.innerText || clone.textContent || '').replace(/\n{3,}/g, '\n\n').trim();
   }
   const downloads = Array.from(last.querySelectorAll(sel.download_button)).filter(reply).length;
+  // The turn-level Copy button appears once the reply is finished.
+  const copy = Array.from(last.querySelectorAll(sel.copy_button))
+    .filter(b => !b.closest(sel.assistant_content) && !b.closest(sel.user_unit)).length;
   return {
     key: last.getAttribute('data-turn-key') || String(turns.length),
     count: turns.length,
     state: st ? st.getAttribute(stAttr) : null,
     userText: user ? user.innerText : '',
     text: contents.map(conv).filter(s => s.trim()).join('\n\n'),
-    imgs, downloads, fallback,
+    imgs, downloads, fallback, copy,
   };
 }
 """.replace("__DOM_TO_MARKDOWN__", DOM_TO_MARKDOWN.strip())
@@ -609,11 +616,18 @@ TURNS_AFTER_JS = r"""
   return { found: true, turns: turns.slice(at + 1).map((t, j) => {
     const st = t.matches(sel.turn_state) ? t : t.querySelector(sel.turn_state);
     const user = t.querySelector(sel.user_unit);
+    let text = Array.from(t.querySelectorAll(sel.assistant_content)).map(conv).filter(s => s.trim()).join('\n\n');
+    if (!text) {
+      // Unknown reply shape: its visible text, without the user's message, buttons and labels.
+      const clone = t.cloneNode(true);
+      clone.querySelectorAll(sel.user_part + ', button, h4, svg, [aria-hidden="true"], .sr-only').forEach(e => e.remove());
+      text = (clone.innerText || clone.textContent || '').replace(/\n{3,}/g, '\n\n').trim();
+    }
     return {
       key: keyOf(t, at + 1 + j),
       state: st ? st.getAttribute(stAttr) : null,
       userText: user ? user.innerText : '',
-      text: Array.from(t.querySelectorAll(sel.assistant_content)).map(conv).filter(s => s.trim()).join('\n\n'),
+      text,
     };
   }) };
 }
@@ -721,6 +735,30 @@ PASTE_JS = r"""
 """
 
 
+MIRRORED_MAX = 2000  # web turns remembered as already seen (posted or not)
+WEB_BLANK_LOOKS = 4    # looks a finished last turn may show no reply before it is given up
+WEB_PARTIAL_LOOKS = 3  # looks a last turn may lack its Copy button before it is posted as it is
+
+
+def pick_web_turns(turns: list[dict], seen: set[str], waiting: set[str] = frozenset()) -> tuple[list[dict], list[str], bool]:
+    """Which turns of a chat page are news. turns: every turn on the page, oldest first; seen: keys
+    of turns the bridge has seen before (in any chat); waiting: keys of turns found new on an
+    earlier look but not ready then. Returns (new, late, first):
+    new   - the turns after the newest seen turn, plus waiting ones wherever they are;
+    late  - keys of unseen turns before the newest seen turn (old turns the page had not shown
+            yet): history, to be recorded and never posted;
+    first - True when no turn on the page was seen before: a chat looked at for the first time,
+            where everything is history."""
+    at = max((i for i, t in enumerate(turns) if t["key"] in seen), default=-1)
+    if at < 0:
+        return [], [], bool(turns)
+    new = [t for i, t in enumerate(turns) if t["key"] not in seen and (i > at or t["key"] in waiting)]
+    late = [t["key"] for i, t in enumerate(turns) if i < at and t["key"] not in seen and t["key"] not in waiting]
+    return new, late, False
+PAGE_FAILS_NOTE = 3  # page loads failed in a row before the channel is told the bridge is retrying
+PAGE_FAILS_ASK = 8   # ... before the user is asked to look after all (a login page we did not recognize?)
+
+
 def conv_id(url: str) -> str:
     m = re.search(r"/c/([0-9a-f-]{8,})", url or "")
     return m.group(1) if m else (url or "").split("?")[0]
@@ -776,6 +814,11 @@ class NeedsHuman(Exception):
     """The ChatGPT page needs the user: login, or a check only a person may click."""
 
 
+class PageNotLoaded(Exception):
+    """The ChatGPT page did not come up (no input box), and it shows no login or verification
+    page either: a rate limit or a half-loaded page. Nothing for the user to do; try again later."""
+
+
 def page_problem(url: str, title: str, body: str) -> str | None:
     t, b = (title or "").lower(), (body or "")[:3000].lower()
     if "just a moment" in t or "challenges.cloudflare.com" in b or "verify you are human" in b:
@@ -799,6 +842,8 @@ class ChatGPT:
         self.too_large = False  # ChatGPT answered our last send with 413 conversation_too_large
         self.crashed = False  # the page's renderer died: page calls would hang, so start a new browser
         self.throttled_until = 0.0  # ChatGPT said 429: no page loads before this time
+        self.last_429_at = 0.0  # time.monotonic() of the last 429
+        self.loaded_at = 0.0  # time.monotonic() of the last full load of the chat page
 
     @property
     def chat_url(self) -> str:
@@ -853,6 +898,9 @@ class ChatGPT:
             except ValueError:
                 wait = 300
             until = time.time() + min(max(wait, 60), 1800)
+            self.last_429_at = time.monotonic()
+            log.info("429 on %s %s (retry-after=%s)", resp.request.method, urlsplit(resp.url).path[:120],
+                     resp.headers.get("retry-after", "-"))
             if until > self.throttled_until:
                 self.throttled_until = until
                 log.warning("ChatGPT answered 429 (rate limited); keeping away for %d s", until - time.time())
@@ -886,6 +934,7 @@ class ChatGPT:
 
     async def open_chat(self, url: str | None = None) -> None:
         url = url or self.chat_url
+        log.info("loading %s", urlsplit(url).path[:80])
         await self.page.goto(url, wait_until="domcontentloaded", timeout=60_000)
         await self.wait_composer()
         self.last_used = self.loaded_at = time.monotonic()
@@ -900,7 +949,9 @@ class ChatGPT:
                 raise NeedsHuman(problem)
             await asyncio.sleep(1)
         problem = page_problem(self.page.url, await self.page.title(), await self._body())
-        raise NeedsHuman(problem or S("problem_no_composer"))
+        if problem:
+            raise NeedsHuman(problem)
+        raise PageNotLoaded(S("problem_no_composer"))
 
     async def _body(self) -> str:
         try:
@@ -1061,15 +1112,25 @@ class ChatGPT:
             log.exception("collecting reply files failed")
             return []
 
-    async def check_for_web_turns(self, seen_key: str | None, fresh_s: float = 0, wait_busy_s: float = 0) -> dict | None:
-        """Reload the chat and return {key, items} for the turns after seen_key: items are the
-        finished turns typed in ChatGPT itself, [{user, text, outputs}], oldest first; key is the
-        newest finished turn. A turn still being answered is left for the next look. Turns the
-        bridge sent (they start with a [speaker] tag) are skipped. Returns None when nothing is new.
+    async def page_turns(self) -> list[dict]:
+        """Every turn on the open page, oldest first: [{key, state, userText, text}]."""
+        return (await self.page.evaluate(TURNS_AFTER_JS, {**self.sel, "seen": ""}))["turns"]
+
+    async def check_for_web_turns(self, seen: set[str] | frozenset[str], fresh_s: float = 0,
+                                  wait_busy_s: float = 0) -> dict | None:
+        """Reload the chat and look for turns typed in ChatGPT itself. seen: keys of every turn the
+        bridge has seen before. Returns {key, items, seen}: items are the finished new turns,
+        [{key, user, text, outputs}], oldest first; seen lists further keys to record as seen without
+        posting (history, turns the bridge sent, turns without a reply); key is the newest of all
+        these. None when there is nothing to post or record.
+        A turn is news only when it comes after a turn seen before. A chat with no turn seen before
+        is being looked at for the first time: all of it is history, nothing is posted. A turn still
+        being answered, or without its reply yet, is left for the next look.
         A page loaded less than fresh_s ago is not loaded again. With wait_busy_s, a turn that is
         still being answered is waited for (the caller is about to send, and would skip it)."""
         if self.crashed or not self.alive():
             await self.start()  # the browser is closed while idle; a check opens it again
+            fresh_s = max(fresh_s, 30)  # start() has just loaded the chat: do not load it twice
         self.last_used = time.monotonic()
         if not (fresh_s and time.monotonic() - getattr(self, "loaded_at", 0.0) < fresh_s
                 and conv_id(self.page.url) == conv_id(self.chat_url)):
@@ -1080,44 +1141,85 @@ class ChatGPT:
                 break
             await asyncio.sleep(1)
             turn = await self.last_turn()
-        await asyncio.sleep(1)
-        turn = await self.last_turn()
-        if not turn["key"] or turn["key"] == seen_key:
+        # Turns keep appearing for a while after the first ones (image turns come late): a page read
+        # too early ends at an older turn. Wait until the count holds.
+        count = -1
+        for _ in range(10):
+            if turn["count"] == count:
+                break
+            count = turn["count"]
+            await asyncio.sleep(1.5)
+            turn = await self.last_turn()
+        waits: dict[str, int] = self.__dict__.setdefault("web_wait", {})  # key -> looks it was not ready
+        seen = set(seen)
+        if not turn["key"]:
             return None
-        last_busy = turn["state"] not in (None, self.sel["turn_done"])
+        done = self.sel["turn_done"]
+        last_busy = turn["state"] not in (None, done)
         if not last_busy and self.page and await self.page.locator(self.sel["stop"]).first.is_visible():
             last_busy = True
         end = time.monotonic() + wait_busy_s
         while last_busy and time.monotonic() < end:
             await asyncio.sleep(2)
             turn = await self.last_turn()
-            last_busy = (turn["state"] not in (None, self.sel["turn_done"])
+            last_busy = (turn["state"] not in (None, done)
                          or await self.page.locator(self.sel["stop"]).first.is_visible())
-        if seen_key is None:  # first look after start: remember, do not replay history
-            return None if last_busy else {"key": turn["key"], "items": []}
-        after = await self.page.evaluate(TURNS_AFTER_JS, {**self.sel, "seen": seen_key})
-        turns = after["turns"] if after.get("found") else [
-            {"key": turn["key"], "state": turn["state"], "userText": turn["userText"], "text": turn["text"]}]
-        key, items = seen_key, []
-        for n, t in enumerate(turns):
-            is_last = n == len(turns) - 1
-            if is_last and last_busy:
+        chat = conv_id(self.chat_url) or "?"
+        turns = await self.page_turns()
+        new, late, first = pick_web_turns(turns, seen, set(waits))
+        if first:
+            await asyncio.sleep(4)  # late turns of a chat never seen must not look new on the next look
+            turns = await self.page_turns()
+            keys = [t["key"] for t in turns]
+            if last_busy and keys:
+                keys.pop()  # being answered right now: that one is news once it is finished
+            log.info("web mirror: chat %s has no turn seen before; %d turns marked as already seen, none posted",
+                     chat, len(keys))
+            return {"key": keys[-1], "items": [], "seen": keys} if keys else None
+        if late:
+            log.info("web mirror: %d older turns of chat %s appeared late; marked as seen, not posted", len(late), chat)
+        record, items, key = list(late), [], None
+        last_key = turns[-1]["key"] if turns else None
+        for t in new:
+            k, is_last = t["key"], t["key"] == last_key
+            if (is_last and last_busy) or (not is_last and t["state"] not in (None, done)):
                 break
-            if not is_last and t["state"] not in (None, self.sel["turn_done"]):
-                break
-            key = t["key"]
             if re.match(r"^\[[^\]]{1,32}\]", (t["userText"] or "").strip()):
-                continue  # a turn the bridge itself sent
-            text, outputs = t["text"], []
+                waits.pop(k, None)
+                record.append(k)  # a turn the bridge itself sent
+                key = k
+                continue
+            text, outputs, whole = t["text"], [], True
             if is_last:
                 text = turn["text"] or turn.get("fallback", "") or text
+                whole = bool(turn.get("copy", 1))
                 if text:
                     text = (await self.copied_reply()) or text
                 outputs = await self.outputs_of_last_turn()
-            items.append({"key": t["key"], "user": t["userText"], "text": text, "outputs": outputs})
-        if seen_key == "":
-            items = items[-10:]  # a chat seen for the first time: its recent turns, not a flood
-        return None if key == seen_key else {"key": key, "items": items}
+            n = waits.get(k, 0) + 1
+            if not (text or "").strip() and not outputs:
+                if is_last and n < WEB_BLANK_LOOKS:  # the reply may not be on the page yet
+                    waits[k] = n
+                    log.info("web mirror: turn %s in chat %s shows no reply yet (look %d of %d); waiting",
+                             k, chat, n, WEB_BLANK_LOOKS)
+                    break
+                log.info("web mirror: turn %s in chat %s has no reply text or files; marked as seen, not posted", k, chat)
+                waits.pop(k, None)
+                record.append(k)
+                key = k
+                continue
+            if not whole and n < WEB_PARTIAL_LOOKS:  # no Copy button: the reply may be unfinished
+                waits[k] = n
+                log.info("web mirror: turn %s in chat %s may be unfinished (look %d of %d); waiting",
+                         k, chat, n, WEB_PARTIAL_LOOKS)
+                break
+            waits.pop(k, None)
+            items.append({"key": k, "user": t["userText"], "text": text or "", "outputs": outputs})
+            key = k
+        for k in list(waits):  # forget waiting turns that left the page
+            if all(t["key"] != k for t in turns):
+                del waits[k]
+        return {"key": key, "items": items, "seen": record} if items or record else None
 
     async def newest_project_chat(self) -> str | None:
         """URL of the project's most recently used chat, read from the sidebar of the open page
@@ -1232,6 +1334,7 @@ def make_bridge(cfg: dict, state: dict):
             self.channel = None
             self.page_lock = asyncio.Lock()
             self.failures = 0  # failed tries of the current batch
+            self.page_fails = 0  # times in a row the ChatGPT page did not load for a batch
             self.caught_up = False
             self.halted = self.state.get("halted")  # {"since": ...} while the user has paused the group
             self.gpt_pending = False  # GPT was addressed while halted
@@ -1243,6 +1346,7 @@ def make_bridge(cfg: dict, state: dict):
             self.wake_missed: list = []  # messages that mentioned Claude while it was starting
             self.web_active_until = 0.0  # until then the web mirror looks every mirror_fast_s
             self.notes = collections.deque(maxlen=50)  # the bridge's own notices: status lines, not conversation
+            self.report_bodies = collections.deque(maxlen=20)  # session reports the bridge posted itself
             self.archive_dir = Path(os.path.expanduser(cfg["archive_dir"])) if cfg.get("archive_dir") else None
             self.archive_lock = asyncio.Lock()
             # Claude watcher
@@ -1253,6 +1357,7 @@ def make_bridge(cfg: dict, state: dict):
                 w.setdefault("project_dir", str(Path.home() / ".claude" / "projects" / re.sub(r"[^A-Za-z0-9]", "-", c["workdir"])))
             w.setdefault("session_name", c.get("name", "Group Claude"))
             self.cw_wake = self.cw_wake or bool(w.get("wake_on_mention"))
+            self.cw_wake_report = bool(w.get("wake_on_report"))  # a posted session report starts a stopped Claude
             w.setdefault("work_dir", str(RUNTIME))
             w.setdefault("lock_file", str(RUNTIME / "ensure.lock"))
             self.cw_dir = Path(os.path.expanduser(w["project_dir"])) if w.get("project_dir") else None
@@ -1269,6 +1374,9 @@ def make_bridge(cfg: dict, state: dict):
                     self.cw_ensure += " -Profile '" + str(PROFILE).replace("'", "''") + "'"
             self.cw_idle_s = float(w.get("idle_stop_min", 0)) * 60  # 0 = never stop an idle Claude
             self.cw_idle_checked = time.time()
+            self.cw_boot_check_at = time.time() + 120  # when to look whether a started Claude came up; 0 = settled
+            self.cw_stuck = False  # the running Claude is waiting at a startup question
+            self.cw_stuck_noted = 0.0
             self.cw_last_session = self.cw_work / "claude-last-session.txt"  # written at an idle stop; the launcher resumes it
             self.cw_lock = os.path.expanduser(w.get("lock_file", ""))
             self.cw_file: Path | None = None
@@ -1307,6 +1415,12 @@ def make_bridge(cfg: dict, state: dict):
             ch = msg.channel
             ids = {self.channel_id, self.log_channel_id} - {None}
             return ch.id in ids or getattr(ch, "parent_id", None) in ids
+
+        def uncapped(self, channel) -> bool:
+            """`log_channel_uncapped`: AI messages in the log channel do not count toward the loop cap."""
+            return bool(self.cfg.get("log_channel_uncapped")) and channel is not None \
+                and self.log_channel_id is not None \
+                and self.log_channel_id in (getattr(channel, "id", None), getattr(channel, "parent_id", None))
 
         def is_log(self, msg) -> bool:
             ch = msg.channel
@@ -1483,6 +1597,8 @@ def make_bridge(cfg: dict, state: dict):
                     await self.gpt.start()
                 except NeedsHuman as e:
                     log.warning("browser needs the user: %s", e)
+                except PageNotLoaded as e:
+                    log.warning("browser started, page not loaded: %s", e)
                 except Exception:
                     log.exception("browser start failed")
             if self.archive_dir is not None:
@@ -1645,6 +1761,9 @@ def make_bridge(cfg: dict, state: dict):
             if msg.author.id == self.user.id:
                 if content.startswith(("**[Codex]**", "\u2699")) or content in self.notes:
                     return  # Codex's fallback posts, bridge control messages and bridge notices
+                if content in self.report_bodies:  # a background session's report: context, never a call
+                    await self.codex.observe(msg, self.tag("Report", msg), self.clean(msg), may_trigger=False)
+                    return
                 speaker = "GPT"
             elif msg.author.id == self.claude_id:
                 speaker = S("claude_label")
@@ -1666,7 +1785,7 @@ def make_bridge(cfg: dict, state: dict):
                 if msg.author.id != self.claude_id and who != "Codex":
                     return
                 now = time.monotonic()
-                if now - self.last_claude_at > 5:  # chunks of one bot reply count once
+                if now - self.last_claude_at > 5 and not self.uncapped(msg.channel):  # chunks of one reply count once
                     self.streak += 1
                 self.last_claude_at = now
                 self.remember(self.tag(who, msg), self.clean(msg), msg.attachments, msg.id)
@@ -1762,6 +1881,7 @@ def make_bridge(cfg: dict, state: dict):
             self.state.update(intro_sent=True, intro_version=int(self.cfg.get("intro_version", 1)),
                               turns_in_chat=0, last_turn_key=self.gpt.last_key)
             save_json(STATE_FILE, self.state)
+            self.mark_seen([self.gpt.last_key])
             await self.note(S("rollover_done", url=url), log_channel=True)
 
         async def browser_idle_watch(self) -> None:
@@ -1794,21 +1914,23 @@ def make_bridge(cfg: dict, state: dict):
                     continue
                 if time.time() < self.gpt.throttled_until:
                     continue  # rate limited: a check would only reload the page again
+                look_at = time.monotonic()
                 try:
                     async def look():
                         async with self.page_lock:
-                            return (await self.gpt.check_for_web_turns(self.state.get("last_turn_key")),
-                                    await self.gpt.newest_project_chat())
+                            got = await self.gpt.check_for_web_turns(self.mirrored())
+                            return got, await self.gpt.newest_project_chat()
                     try:
                         # never hold the page for long: a hung page call must not block messages to GPT
                         found, newest = await asyncio.wait_for(look(), 300)
-                        fails = 0
+                        # A look that drew a 429 counts as a failed one: the next look comes later.
+                        fails = fails + 1 if self.gpt.last_429_at >= look_at else 0
                     except asyncio.TimeoutError:
                         log.warning("mirror check hung for 5 min; the browser will be restarted")
                         self.gpt.crashed = True
                         continue
                     if found:
-                        await self.post_web_turns(found)
+                        await self.post_web_turns(found, "periodic")
                     # The user went on in another chat of the project: follow them there. Seen as the
                     # newest chat on two looks in a row, so one odd sidebar render does not move us.
                     if newest and conv_id(newest) != conv_id(self.gpt.chat_url):
@@ -1819,37 +1941,69 @@ def make_bridge(cfg: dict, state: dict):
                             self.follow_candidate = conv_id(newest)
                     else:
                         self.follow_candidate = None
-                except NeedsHuman as e:
+                except (NeedsHuman, PageNotLoaded) as e:
                     fails += 1
-                    log.warning("mirror check needs the user: %s (next look in %d s)", e,
+                    log.warning("mirror check %s: %s (next look in %d s)",
+                                "needs the user" if isinstance(e, NeedsHuman) else "found no page", e,
                                 min(interval * (2 ** min(fails, 4)), 3600))
                 except Exception:
                     if not self.stopping:  # a look cut short by the bridge stopping is not an error
                         log.exception("mirror check failed")
 
-        async def post_web_turns(self, found: dict) -> None:
-            """Post the turns the user typed in ChatGPT itself to the channel and remember how far we got."""
+        def mirrored(self) -> set[str]:
+            """Keys of the turns the bridge has seen before, in any chat: posted, sent by the bridge,
+            or history found on a first look."""
+            keys = set(self.state.get("mirrored_keys", []))
+            keys.add(self.state.get("last_turn_key"))
+            keys.update((self.state.get("chat_seen") or {}).values())
+            return {k for k in keys if k}
+
+        def mark_seen(self, keys) -> None:
+            """Record turn keys as seen, so that they are never posted as news."""
+            have = self.state.get("mirrored_keys", [])
+            known = set(have)
+            add = [k for k in dict.fromkeys(keys) if k and k not in known]
+            if add:
+                self.state["mirrored_keys"] = (have + add)[-MIRRORED_MAX:]
+                save_json(STATE_FILE, self.state)
+
+        async def post_web_turns(self, found: dict, look: str = "") -> None:
+            """Post the turns the user typed in ChatGPT itself to the channel and remember what was seen."""
+            chat = conv_id(self.gpt.chat_url) or "?"
+            self.mark_seen(found.get("seen", []))
+            posted = 0
             for item in found["items"]:
+                if item["key"] in self.mirrored():
+                    continue  # never post a turn twice, whatever the page showed this time
+                if not (item["text"] or "").strip() and not item["outputs"]:
+                    log.info("web mirror: turn %s in chat %s has nothing to post; marked as seen", item["key"], chat)
+                    self.mark_seen([item["key"]])
+                    continue  # never post an empty reply
                 user = (item["user"] or "").strip()
                 quote = "\n".join("> " + line for line in user[:800].splitlines() if line.strip())
-                log.info("mirroring a turn typed in ChatGPT (%d chars)", len(item["text"]))
+                log.info("mirroring a turn typed in ChatGPT (%d chars, %d files; turn %s, chat %s, %s look)",
+                         len(item["text"]), len(item["outputs"]), item["key"], chat, look or "unnamed")
                 try:
                     await self.post_reply(f"{S('mirror_header')}\n{quote}\n\n{item['text']}", True, item["outputs"])
                 except Exception:
-                    # The position is saved only after a turn is posted, so the next look tries it again;
+                    # A turn is recorded only after it is posted, so the next look tries it again;
                     # a turn that fails three times is given up, or it would block the ones after it.
                     key, n = self.web_fail
                     self.web_fail = (item["key"], n + 1 if key == item["key"] else 1)
                     if self.web_fail[1] < 3:
                         raise
                     log.exception("a web turn could not be posted three times; skipping it")
+                posted += 1
                 self.state["turns_in_chat"] = int(self.state.get("turns_in_chat", 0)) + 1
                 self.streak, self.capped = 0, False  # a human started this turn
                 self.state["last_turn_key"] = item["key"]
+                self.mark_seen([item["key"]])
                 save_json(STATE_FILE, self.state)
-            self.state["last_turn_key"] = found["key"]
-            save_json(STATE_FILE, self.state)
-            if found["items"]:  # the user is working in ChatGPT right now: look more often for a while
+            if found.get("key"):
+                self.state["last_turn_key"] = found["key"]
+                self.mark_seen([found["key"]])
+                save_json(STATE_FILE, self.state)
+            if posted:  # the user is working in ChatGPT right now: look more often for a while
                 self.web_active_until = time.time() + float(self.cfg.get("mirror_fast_for_s", 600))
 
         async def follow_chat(self, url: str) -> None:
@@ -1868,7 +2022,7 @@ def make_bridge(cfg: dict, state: dict):
             while len(seen) > 30:
                 seen.pop(next(iter(seen)))
             self.state["chat_url"] = url
-            self.state["last_turn_key"] = seen.get(conv_id(url)) or ""  # "" = mirror its recent turns
+            self.state["last_turn_key"] = seen.get(conv_id(url)) or ""  # "" = never looked at: its turns are history
             self.state["intro_sent"] = False  # GPT in that chat has not heard how the group works
             self.state["turns_in_chat"] = 0
             save_json(STATE_FILE, self.state)
@@ -1876,6 +2030,12 @@ def make_bridge(cfg: dict, state: dict):
         def requeue(self, batch: str, atts, newest: int = 0) -> None:
             """Put a batch that did not reach GPT back at the front of the buffer."""
             self.buffer.insert(0, [None, batch, time.monotonic(), list(atts), newest])
+
+        def page_retry_delay(self, fails: int) -> float:
+            """Seconds before a batch is sent again after the page did not load: past the rate
+            limit window when there is one, and longer with every failure in a row."""
+            throttled = max(self.gpt.throttled_until - time.time(), 0)
+            return throttled + min(60 * 2 ** min(fails - 1, 4), 900)
 
         async def retry_later(self, delay: float) -> None:
             await asyncio.sleep(delay)
@@ -1926,12 +2086,13 @@ def make_bridge(cfg: dict, state: dict):
         def _cw_find(self) -> Path | None:
             if not self.cw_dir or not self.cw_dir.is_dir():
                 return None
-            marker = f'"customTitle":"{self.cw_name}"'
+            # the title may carry a prefix (claude.name_format, e.g. a start date) before the session name
+            marker = re.compile(r'"customTitle":"[^"]*' + re.escape(json.dumps(self.cw_name, ensure_ascii=False)[1:-1]) + '"')
             for f in sorted(self.cw_dir.glob("*.jsonl"), key=lambda x: x.stat().st_mtime, reverse=True)[:12]:
                 key = str(f)
                 if key not in self.cw_known:
                     try:
-                        self.cw_known[key] = marker in f.read_text(encoding="utf-8", errors="replace")
+                        self.cw_known[key] = bool(marker.search(f.read_text(encoding="utf-8", errors="replace")))
                     except Exception:
                         self.cw_known[key] = False
                 if self.cw_known[key]:
@@ -2002,6 +2163,8 @@ def make_bridge(cfg: dict, state: dict):
                     log.warning("Claude cannot answer: %s", text.strip()[:200])
                     await self.note(S("claude_login_expired"))
             now = time.time()
+            if self.cw_boot_check_at and now >= self.cw_boot_check_at and not self.waking:
+                await self.check_claude_startup()
             if self.cw_idle_s and now - self.cw_idle_checked >= 300:
                 self.cw_idle_checked = now
                 await self.stop_idle_claude()
@@ -2026,6 +2189,56 @@ def make_bridge(cfg: dict, state: dict):
                 return int(out.decode().strip() or 0) > 0
             except ValueError:
                 return True  # unsure: do not start a second one
+
+        async def check_claude_startup(self) -> None:
+            """A started Claude whose Discord plugin never loaded is waiting at a startup question in
+            its hidden console (a trust or API-key prompt, often new after a CLI update) and receives
+            nothing. Its sign: the process is two minutes old and has no child process. Say so in
+            the channel, with what its screen shows."""
+            name = (self.cw_name or "").replace("'", "''")
+            ps = ("$all = Get-CimInstance Win32_Process; "
+                  "$c = @($all | Where-Object { $_.Name -eq 'claude.exe' -and $_.CommandLine -match '--channels' "
+                  "-and $_.CommandLine -like '*" + name + "*' } | Sort-Object CreationDate); "
+                  "if (-not $c) { 'none'; exit }; $p = $c[-1]; "
+                  "'{0} {1} {2}' -f $p.ProcessId, [int]((Get-Date) - $p.CreationDate).TotalSeconds, "
+                  "@($all | Where-Object { $_.ParentProcessId -eq $p.ProcessId }).Count")
+            proc = await asyncio.create_subprocess_exec(
+                "powershell.exe", "-NoProfile", "-Command", ps, stdout=asyncio.subprocess.PIPE,
+                creationflags=0x08000000)
+            out, _ = await proc.communicate()
+            fields = out.decode(errors="replace").split()
+            if len(fields) != 3 or not all(x.isdigit() for x in fields):  # not running, or unsure
+                self.cw_boot_check_at, self.cw_stuck = 0, False
+                return
+            pid, age, kids = fields[0], int(fields[1]), int(fields[2])
+            if kids:  # it came up
+                self.cw_boot_check_at, self.cw_stuck = 0, False
+                return
+            if age < 110:
+                return  # still starting: look again at the next round
+            self.cw_boot_check_at, self.cw_stuck, self.cw_stuck_noted = 0, True, time.time()
+            screen = await self.read_console(pid)
+            log.warning("Claude (pid %s) started %d s ago but never came up; its screen: %s", pid, age,
+                        screen.replace("\n", " | ")[:400] or "(unreadable)")
+            await self.note(S("claude_stuck_startup", screen=screen) if screen else S("claude_stuck_unknown"))
+
+        async def read_console(self, pid: str) -> str:
+            """The last lines on the hidden console of process `pid`, or "" when it cannot be read."""
+            out_file = self.cw_work / "logs" / "claude-console.txt"
+            try:
+                out_file.parent.mkdir(parents=True, exist_ok=True)
+                out_file.unlink(missing_ok=True)
+                proc = await asyncio.create_subprocess_exec(
+                    "powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File",
+                    str(ROOT / "scripts" / "read-console.ps1"), "-TargetPid", pid, "-OutFile", str(out_file),
+                    stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL, creationflags=0x08000000)
+                await asyncio.wait_for(proc.wait(), 40)
+                text = out_file.read_text(encoding="utf-8", errors="replace")
+            except (OSError, asyncio.TimeoutError):
+                return ""
+            lines = [ln.strip() for ln in text.splitlines()]
+            lines = [ln for ln in lines if ln and not re.fullmatch(r"[─━═\-_\s]+", ln)]  # no rules, no blanks
+            return "\n".join(lines[-12:]).replace("```", "'''")[-900:]
 
         async def stop_idle_claude(self) -> None:
             """Stop this project's Claude session after claude_watch.idle_stop_min minutes without
@@ -2082,7 +2295,12 @@ def make_bridge(cfg: dict, state: dict):
                 if msg.id not in [m.id for m, _ in self.wake_missed]:
                     self.wake_missed.append((msg, text))
                 return
-            if not self.cw_ensure or await self.claude_running():
+            if not self.cw_ensure:
+                return
+            if await self.claude_running():
+                # still waiting at its startup question: tell the person who called it, at most every 5 minutes
+                if self.cw_stuck and not msg.author.bot and time.time() - self.cw_stuck_noted > 300:
+                    self.cw_boot_check_at = time.time()
                 return
             if self.cw_paused_until and time.time() < self.cw_paused_until:
                 when = time.strftime("%H:%M", time.localtime(self.cw_paused_until))
@@ -2091,7 +2309,8 @@ def make_bridge(cfg: dict, state: dict):
             self.waking = True
             try:
                 log.info("Claude is not running; waking it for message %s", msg.id)
-                await self.note(S("claude_waking"))
+                if not msg.author.bot:  # only a person who called Claude is told; Discord's status dot shows the rest
+                    await self.note(S("claude_waking"))
                 ps = ""
                 if self.cw_lock:
                     ps += f"Remove-Item '{self.cw_lock}' -ErrorAction SilentlyContinue; "
@@ -2105,6 +2324,7 @@ def make_bridge(cfg: dict, state: dict):
                 proc = await asyncio.create_subprocess_exec("powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass",
                                                             "-Command", ps, creationflags=0x08000000)
                 await proc.wait()
+                self.cw_boot_check_at = time.time() + 120
                 await asyncio.sleep(50)  # the new session needs a moment to connect to Discord
                 if not await self.claude_running():
                     await self.note(S("claude_wake_failed"))
@@ -2168,6 +2388,7 @@ def make_bridge(cfg: dict, state: dict):
             proc = await asyncio.create_subprocess_exec("powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps)
             await proc.wait()
             self.cw_file, self.cw_ctx, self.cw_nudged_at = None, 0, time.time()
+            self.cw_boot_check_at = time.time() + 120
             await asyncio.sleep(45)  # the new session needs a moment to connect to Discord
             await self.control(S("tag_handoff"), S("handoff_claude", handoff=handoff))
             log.info("Claude restarted as a fresh session")
@@ -2202,11 +2423,11 @@ def make_bridge(cfg: dict, state: dict):
                             try:
                                 busy_s = min(float(self.cfg["reply_timeout_s"]), 600)
                                 found = await asyncio.wait_for(
-                                    self.gpt.check_for_web_turns(self.state.get("last_turn_key"), fresh_s=10,
-                                                                 wait_busy_s=busy_s), busy_s + 180)
+                                    self.gpt.check_for_web_turns(self.mirrored(), fresh_s=10, wait_busy_s=busy_s),
+                                    busy_s + 180)
                                 if found:
-                                    await self.post_web_turns(found)
-                            except NeedsHuman:
+                                    await self.post_web_turns(found, "before sending")
+                            except (NeedsHuman, PageNotLoaded):
                                 raise
                             except Exception:
                                 log.exception("looking for web turns before sending failed")
@@ -2227,12 +2448,13 @@ def make_bridge(cfg: dict, state: dict):
                         except asyncio.TimeoutError:
                             self.gpt.crashed = True  # the next try starts a new browser
                             raise RuntimeError("ChatGPT page stopped responding")
-                    self.failures = 0
+                    self.failures = self.page_fails = 0
                     self.state.update(intro_sent=True, intro_version=version, last_turn_key=self.gpt.last_key,
                                       turns_in_chat=int(self.state.get("turns_in_chat", 0)) + 1)
                     if newest:  # a restart re-reads the channel from here
                         self.state["delivered_msg_id"] = str(max(newest, int(self.state.get("delivered_msg_id") or 0)))
                     save_json(STATE_FILE, self.state)
+                    self.mark_seen([self.gpt.last_key])  # the bridge's own turn is never news
                     # GPT has answered: from here a failure must not send the batch to GPT again.
                     for attempt in range(3):
                         try:
@@ -2246,6 +2468,19 @@ def make_bridge(cfg: dict, state: dict):
                     self.requeue(batch, atts, newest)
                     self.reply_target = self.reply_target or target
                     await self.note(S("needs_human_ask", problem=e))
+                except PageNotLoaded as e:
+                    # Rate limited or half loaded: keep the batch and send it again without the user.
+                    self.requeue(batch, atts, newest)
+                    self.reply_target = self.reply_target or target
+                    self.page_fails += 1
+                    delay = self.page_retry_delay(self.page_fails)
+                    log.warning("page did not load (try %d, 429 %s); sending again in %d s", self.page_fails,
+                                "seen" if self.gpt.throttled_until > time.time() else "not seen", delay)
+                    if self.page_fails == PAGE_FAILS_NOTE:  # say it once, so a long wait is not silent
+                        await self.note(S("page_retrying", problem=e))
+                    elif self.page_fails == PAGE_FAILS_ASK:
+                        await self.note(S("needs_human_ask", problem=e))
+                    asyncio.create_task(self.retry_later(delay))
                 except Exception as e:
                     # Never drop the batch: put it back, then retry (or roll over to a new chat).
                     self.requeue(batch, atts, newest)
@@ -2262,11 +2497,14 @@ def make_bridge(cfg: dict, state: dict):
                                 await self.rollover(handoff=False, reason=S("reason_too_long"))
                             self.trigger.set()
                         elif tries < 3:
-                            async with self.page_lock:
-                                if isinstance(e, ReplyFailed) and self.gpt.alive():
-                                    await self.gpt.open_chat()  # reload: shows the chat as the server has it
-                                else:
-                                    await self.gpt.start()
+                            try:
+                                async with self.page_lock:
+                                    if isinstance(e, ReplyFailed) and self.gpt.alive():
+                                        await self.gpt.open_chat()  # reload: shows the chat as the server has it
+                                    else:
+                                        await self.gpt.start()
+                            except PageNotLoaded as e2:  # the retry loads it again
+                                log.warning("reload for the retry failed: %s", e2)
                             asyncio.create_task(self.retry_later(30 * tries))
                         else:
                             self.failures = 0
@@ -2336,7 +2574,8 @@ def make_bridge(cfg: dict, state: dict):
                 save_json(STATE_FILE, self.state)
                 if self.cw_wake and f"<@{self.claude_id}>" in text:
                     self.loop.create_task(self.wake_claude(first_msg, text))  # GPT called a Claude that may be stopped
-            self.streak += 1
+            if not self.uncapped(channel):
+                self.streak += 1
             log.info("gpt posted %d chars, %d files (streak=%d)", len(text), len(files), self.streak)
 
         # -- Session reports: another Claude Code session writes data/reports/<name>.md when done
@@ -2388,6 +2627,7 @@ def make_bridge(cfg: dict, state: dict):
                 sending = f.with_name(f.name + ".sending")
                 f.replace(sending)
                 ping = discord.AllowedMentions(users=[discord.Object(id=self.claude_id)])
+                self.report_bodies.append(body.strip())  # before sending: the post comes back through on_message
                 try:
                     try:
                         files = [discord.File(io.BytesIO(data), filename=f.name)] if data is not None else []
@@ -2401,8 +2641,8 @@ def make_bridge(cfg: dict, state: dict):
                     raise
                 sending.replace(dest)
                 log.info("posted session report %s (%d chars)", f.name, len(text))
-                if self.cw_wake:
-                    self.loop.create_task(self.wake_claude(sent, body))  # the report is for a Claude that may be stopped
+                if self.cw_wake and self.cw_wake_report:  # off by default: a background report waits in the channel
+                    self.loop.create_task(self.wake_claude(sent, body))
 
         # -- Status board: Claude rewrites data/status.md, the bridge keeps one pinned message in step
         async def status_watch(self) -> None:
@@ -2521,8 +2761,8 @@ async def run_probe(cfg: dict, state: dict) -> None:
             "copy_len": len(copied or ""),
             "dom_len": len(turn["text"]),
         }, ensure_ascii=False, indent=2), flush=True)
-    except NeedsHuman as e:
-        print("NEEDS HUMAN:", e, "| url:", gpt.page.url if gpt.page else None, flush=True)
+    except (NeedsHuman, PageNotLoaded) as e:
+        print("NEEDS HUMAN:" if isinstance(e, NeedsHuman) else "PAGE NOT LOADED:", e, "| url:", gpt.page.url if gpt.page else None, flush=True)
     finally:
         await gpt.shutdown()
 

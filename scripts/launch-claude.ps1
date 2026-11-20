@@ -12,6 +12,7 @@
 #   token_file         a file with DISCORD_BOT_TOKEN=... when state_dir has no .env of its own
 #   access_mode        DISCORD_ACCESS_MODE, e.g. "static"
 #   permission_wording wording of the Allow/Deny post (see plugin-patch\allow-bots.mjs)
+#   name_format        session title with the start time: {M} month, {d} day, {H} hour, {name} the session name
 param([string]$Profile, [string]$Resume)
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot '_profile.ps1') -Profile $Profile
@@ -62,6 +63,21 @@ if (-not $Resume -and (Test-Path -LiteralPath $lastFile)) {
   if ($last -and (Test-Path -LiteralPath (Join-Path $projectDir ($last + '.jsonl')))) { $Resume = $last }
 }
 
+# claude.name_format puts the session's start time in front of its name, e.g. "{M}/{d} {H}h {name}".
+# The name itself must stay in the title: the bridge and these scripts find the session by it.
+$title = $sessionName
+if ($c.name_format) {
+  $t = Get-Date
+  if ($Resume) {  # a continued session keeps the time it first started
+    $pd = Join-Path $env:USERPROFILE ('.claude\projects\' + ($c.workdir -replace '[^A-Za-z0-9]', '-'))
+    if ($cfg.claude_watch.project_dir) { $pd = Expand-Home $cfg.claude_watch.project_dir }
+    $old = Join-Path $pd ($Resume + '.jsonl')
+    if (Test-Path -LiteralPath $old) { $t = (Get-Item -LiteralPath $old).CreationTime }
+  }
+  $title = ([string]$c.name_format).Replace('{M}', $t.Month).Replace('{d}', $t.Day).Replace('{H}', $t.Hour).Replace('{name}', $sessionName)
+  if ($title.IndexOf($sessionName) -lt 0) { $title = $title + ' ' + $sessionName }
+}
+
 $claude = (Get-Command claude -ErrorAction SilentlyContinue).Source
 if (-not $claude) { $claude = Join-Path $env:USERPROFILE '.local\bin\claude.exe' }
 $cliArgs = @()
@@ -70,7 +86,7 @@ $cliArgs += @(
   '--channels', 'plugin:discord@claude-plugins-official',
   '--permission-mode', $(if ($c.permission_mode) { $c.permission_mode } else { 'auto' }),
   '--model', $(if ($c.model) { $c.model } else { 'sonnet' }),
-  '--name', $sessionName,
+  '--name', $title,
   '--add-dir', $runtime,  # handoff, status and restart files: no Allow click needed for them
   '--append-system-prompt-file', $prompt)
 
