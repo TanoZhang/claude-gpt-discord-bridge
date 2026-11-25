@@ -29,15 +29,16 @@ if ($c.prompt_file) {
   $text = Get-Content $template -Raw -Encoding UTF8
   $text = $text.Replace('{{OWNER_ID}}', $cfg.owner_id).Replace('{{GPT_BOT_ID}}', $cfg.gpt_bot_id)
   $text = $text.Replace('{{CLAUDE_BOT_ID}}', $cfg.claude_bot_id).Replace('{{CHANNEL_ID}}', $cfg.channel_id)
-  $text = $text.Replace('{{HANDOFF_FILE}}', (Join-Path $runtime 'handoff.md')).Replace('{{RESTART_FILE}}', (Join-Path $runtime 'restart.request'))
+  $text = $text.Replace('{{HANDOFF_FILE}}', (Join-Path $runtime 'handoff.md')).Replace('{{RESTART_FILE}}', (Join-Path $runtime 'restart.request')).Replace('{{MODEL_FILE}}', (Join-Path $runtime 'claude-model.json'))
   $text = $text.Replace('{{REPORTS_DIR}}', (Join-Path $runtime 'reports')).Replace('{{STATUS_FILE}}', (Join-Path $runtime 'status.md'))
   $text = $text.Replace('{{LOG_CHANNEL_ID}}', $(if ($cfg.log_channel_id) { $cfg.log_channel_id } else { '' }))
   Set-Content -Path $prompt -Value $text -Encoding UTF8
 }
 
-# Bots whose messages Claude may read: GPT, and Codex when it is a member of the group.
+# Bots whose messages Claude may read: GPT, and Codex and Gemini when they are members of the group.
 $bots = @($cfg.gpt_bot_id)
 if ($cfg.codex.enabled -and $cfg.codex.bot_id) { $bots += $cfg.codex.bot_id }
+if ($cfg.gemini.enabled -and $cfg.gemini.bot_id) { $bots += $cfg.gemini.bot_id }
 $bots = ($bots | Where-Object { $_ }) -join ','
 $env:BUN_OPTIONS = '--preload=' + ((Join-Path $root 'plugin-patch\allow-bots.mjs') -replace '\\', '/')
 $env:DISCORD_ALLOW_BOT_IDS = $bots
@@ -80,15 +81,28 @@ if ($c.name_format) {
 
 $claude = (Get-Command claude -ErrorAction SilentlyContinue).Source
 if (-not $claude) { $claude = Join-Path $env:USERPROFILE '.local\bin\claude.exe' }
+# Model and effort: claude.model / claude.effort, unless Claude switched them on the owner's
+# instruction by writing <runtime>\claude-model.json ({"model": "...", "effort": "..."}).
+$model = $(if ($c.model) { $c.model } else { 'sonnet' })
+$effort = $c.effort
+$switchFile = Join-Path $runtime 'claude-model.json'
+if (Test-Path -LiteralPath $switchFile) {
+  try {
+    $sw = Get-Content -LiteralPath $switchFile -Raw | ConvertFrom-Json
+    if ($sw.model -and $sw.model -ne 'default') { $model = $sw.model }
+    if ($sw.effort -and $sw.effort -ne 'default') { $effort = $sw.effort }
+  } catch { Write-Warning "ignoring ${switchFile}: $_" }
+}
 $cliArgs = @()
 if ($Resume) { $cliArgs += @('--resume', $Resume) }
 $cliArgs += @(
   '--channels', 'plugin:discord@claude-plugins-official',
   '--permission-mode', $(if ($c.permission_mode) { $c.permission_mode } else { 'auto' }),
-  '--model', $(if ($c.model) { $c.model } else { 'sonnet' }),
+  '--model', $model,
   '--name', $title,
-  '--add-dir', $runtime,  # handoff, status and restart files: no Allow click needed for them
+  '--add-dir', $runtime,  # handoff, status, restart and model files: no Allow click needed for them
   '--append-system-prompt-file', $prompt)
+if ($effort) { $cliArgs += @('--effort', $effort) }
 
 Set-Location -LiteralPath $c.workdir
 & $claude @cliArgs

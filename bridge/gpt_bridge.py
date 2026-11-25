@@ -154,6 +154,7 @@ DEFAULT_STRINGS = {
     "limit_over_claude": "Your usage limit should have reset: continue the work that was cut off. Check `git worktree list` and the latest channel messages first, and report when done.",
     "ctx_claude": "Your context is about {k}k tokens. When no background task is running: write a handoff to `{handoff}` (what is done, what is in progress and where, next steps, questions for the user), then create the empty file `{restart}`. The bridge starts a fresh session that reads the handoff first.",
     "restart_start": "♻️ Claude asked for a fresh session (saves tokens); restarting...",
+    "restart_resume": "♻️ Claude is switching its model or effort ({setting}); restarting in the same conversation...",
     "handoff_claude": "You are a fresh session replacing the previous Claude. Read `{handoff}` first, continue from it, and say in one line what you took over.",
     "status_halted": "Group: ⏸️ paused by the user (`!resume` to continue)",
     "status_running": "Group: ▶️ running",
@@ -182,29 +183,42 @@ DEFAULT_STRINGS = {
     "claude_waking": "💤 Claude is not running; waking it (about a minute)...",
     "claude_wake_failed": "Claude could not be started. Start its session by hand.",
     "wake_claude": "You are a freshly started session: the user mentioned you in Discord and that woke you. Read `{handoff}` first, check `git worktree list`, then answer the user's message in {where} (you did not receive it): \"{text}\"",
-    "codex_loop_cap": "(AI messages in a row: {n}. Codex is not starting; waiting for a human.)",
-    "codex_failed": "(Codex did not finish this time: {err}. The messages are kept; the next @Codex sends them again.)",
-    "codex_limit": "Codex usage or rate limit reached: {err}",
-    "codex_empty": "(Codex returned nothing.)",
-    "codex_stalled": "Codex produced nothing for {min} min and was stopped",
-    "codex_timeout": "Codex ran longer than {min} min and was stopped",
-    "codex_continue": "[The previous run was cut off: {err}] Continue the same task from where it stopped; do not start over. Check what is already done first.",
-    "codex_too_big": "(These files are over Discord's upload limit and were not sent: {files})",
-    "codex_recent_header": "[Your most recent replies in the previous session]",
-    "codex_context_header": "[Group chat messages since your last reply]",
-    "codex_files_header": "[Attachments sent with the messages, saved locally]",
-    "codex_target": "[This reply will be posted in the {name}]",
-    "codex_main": "main channel",
-    "codex_log": "log channel",
-    "codex_stopped": "Codex's current turn was stopped.",
-    "codex_not_running": "Codex is not running right now.",
-    "codex_new": "The next @Codex starts a new Codex session.",
-    "codex_status": "Codex: {state}; session {session}, {turns} turns so far; {pending} messages waiting for it; posting as {poster}.",
-    "codex_running": "running", "codex_idle": "idle", "codex_new_session": "(new)",
-    "codex_poster_bot": "the Codex bot", "codex_poster_gpt": "the GPT bot (Codex bot not logged in)",
+    # Coding-agent members (Codex, Gemini): {name} is the member's name.
+    "agent_loop_cap": "(AI messages in a row: {n}. {name} is not starting; waiting for a human.)",
+    "agent_failed": "({name} did not finish this time: {err}. The messages are kept; the next @{name} sends them again.)",
+    "agent_limit": "{name} usage or rate limit reached: {err}",
+    "agent_empty": "({name} returned nothing.)",
+    "agent_stalled": "{name} produced nothing for {min} min and was stopped",
+    "agent_timeout": "{name} ran longer than {min} min and was stopped",
+    "agent_continue": "[The previous run was cut off: {err}] Continue the same task from where it stopped; do not start over. Check what is already done first.",
+    "agent_too_big": "(These files are over Discord's upload limit and were not sent: {files})",
+    "agent_recent_header": "[Your most recent replies in the previous session]",
+    "agent_context_header": "[Group chat messages since your last reply]",
+    "agent_files_header": "[Attachments sent with the messages, saved locally]",
+    "agent_target": "[This reply will be posted in the {where}]",
+    "agent_main": "main channel",
+    "agent_log": "log channel",
+    "agent_stopped": "{name}'s current turn was stopped.",
+    "agent_not_running": "{name} is not running right now.",
+    "agent_new": "The next @{name} starts a new {name} session.",
+    "agent_status": "{name}: {state}; session {session}, {turns} turns so far; {pending} messages waiting for it; posting as {poster}.",
+    "agent_running": "running", "agent_idle": "idle", "agent_new_session": "(new)",
+    "agent_poster_bot": "the {name} bot", "agent_poster_gpt": "the GPT bot ({name} bot not logged in)",
+    "agent_usage": " Last turn: model {model} ({tier}), {last} tokens; {total} tokens since the bridge started.",
+    "agent_model_line": " Model {model}, effort {effort}.",
+    "agent_default_value": "default",
+    "agent_model_words": "model|effort|reasoning",  # a request matching this regex gets the switch help
+    "agent_switch_help": "[Your model and effort] You run on model {model}, effort {effort}. Only when {user} tells you to change them, write [[model:NAME]] and/or [[effort:LEVEL]] in your reply (NAME from {models}; LEVEL one of: {efforts}; \"default\" returns to the configured one). The bridge applies it from your next turn and says so in the channel; do not change any config file yourself.",
+    "agent_switched": "({name} uses {what} {value} from its next turn.)",
+    "agent_switch_bad": "({name}: {what} \"{value}\" is not one of: {choices}. Nothing changed.)",
+    "agent_switch_refused": "({name} asked to change its model or effort, but only the owner can ask for that. Nothing changed.)",
     "fresh_words": "fresh",  # `!gpt new <word>`: space-separated words that mean "no handoff summary"
     "tag_pause": "[Pause]", "tag_resume": "[Resume]", "tag_limit_over": "[Limit over]",
     "tag_context": "[Context]", "tag_handoff": "[Handoff]",
+    "tag_switched": "[Model]",
+    "tag_progress": "[Progress check]",
+    "progress_claude": "Nobody has moved for {min} min while the status board lists work in progress. Check where each item stands (background jobs, Codex or Gemini tasks); carry on with the next step that needs no decision from the user, and nudge Codex or Gemini in the log if their part is due. Post only what changed (results for the user in the main channel, details in the log); if nothing changed and nothing is due, post nothing.",
+    "switched_claude": "You were restarted in the same conversation, now on {setting}. Say so in one line and continue where you stopped.",
     "claude_login_expired": "⚠️ Claude's login has expired, so it cannot answer. Run `claude` in a terminal, enter `/login`, then @Claude again. GPT and Codex are not affected.",
     "claude_not_logged_in": "⚠️ Claude started but is not logged in, so it cannot answer. Run `claude` in a terminal, enter `/login`, then @Claude again. GPT and Codex are not affected.",
     "claude_stuck_startup": "⚠️ Claude was started but never came up: it is waiting at a startup question in its hidden window, so it receives nothing. Its screen shows:\n```\n{screen}\n```\nAnswer it on the computer (or settle what it asks), then restart this project's bridge. GPT and Codex are not affected.",
@@ -1374,6 +1388,9 @@ def make_bridge(cfg: dict, state: dict):
                     self.cw_ensure += " -Profile '" + str(PROFILE).replace("'", "''") + "'"
             self.cw_idle_s = float(w.get("idle_stop_min", 0)) * 60  # 0 = never stop an idle Claude
             self.cw_idle_checked = time.time()
+            # 0 = off: no automatic progress checks while the board lists work in progress
+            self.cw_progress_s = float(w.get("progress_check_min", 0)) * 60
+            self.cw_progress_checked = self.cw_progress_sent = time.time()
             self.cw_boot_check_at = time.time() + 120  # when to look whether a started Claude came up; 0 = settled
             self.cw_stuck = False  # the running Claude is waiting at a startup question
             self.cw_stuck_noted = 0.0
@@ -1387,14 +1404,20 @@ def make_bridge(cfg: dict, state: dict):
             self.cw_paused_until: float | None = None
             self.cw_limit_text = ""
             self.cw_login_noted = 0.0
-            # Codex CLI as a group member (optional, config "codex")
-            self.codex = None
-            if cfg.get("codex", {}).get("enabled"):
-                sys.path.insert(0, str(Path(__file__).resolve().parent))
-                from codex_agent import CodexAgent
-                self.codex = CodexAgent(self, discord, cfg, state, lambda: save_json(STATE_FILE, self.state), log,
-                                        {"split_message": split_message, "fence_tables": fence_tables,
-                                         "outbox": OUTBOX_DIR, "root": ROOT if PROFILE is None else RUNTIME, "S": S})
+            # Coding-agent CLIs as group members (optional, config "codex" and "gemini")
+            self.members = []
+            helpers = {"split_message": split_message, "fence_tables": fence_tables,
+                       "outbox": OUTBOX_DIR, "root": ROOT if PROFILE is None else RUNTIME, "S": S}
+            sys.path.insert(0, str(Path(__file__).resolve().parent))
+            for key, module, cls in (("codex", "codex_agent", "CodexAgent"), ("gemini", "gemini_agent", "GeminiAgent")):
+                if cfg.get(key, {}).get("enabled"):
+                    agent_cls = getattr(__import__(module), cls)
+                    self.members.append(agent_cls(self, discord, cfg, state, lambda: save_json(STATE_FILE, self.state),
+                                                  log, helpers))
+
+        def member_of(self, msg):
+            """The member whose bot wrote this message, or None."""
+            return next((m for m in self.members if m.is_mine(msg)), None)
 
         # -- helpers
         @property
@@ -1407,8 +1430,8 @@ def make_bridge(cfg: dict, state: dict):
             ids = {int(x) for x in group.get("allowFrom", []) if str(x).isdigit()}
             ids.discard(self.user.id if self.user else 0)
             ids.discard(self.claude_id)
-            if self.codex:
-                ids.discard(self.codex.bot_id)
+            for m in self.members:
+                ids.discard(m.bot_id)
             return ids or {self.owner_id}
 
         def in_channel(self, msg) -> bool:
@@ -1581,8 +1604,9 @@ def make_bridge(cfg: dict, state: dict):
             self.loop.create_task(self.reports_watch())
             self.loop.create_task(self.status_watch())
             self.loop.create_task(self.browser_idle_watch())
-            if self.codex and self.codex.enabled:
-                self.loop.create_task(self.codex.start())
+            for m in self.members:
+                if m.enabled:
+                    self.loop.create_task(m.start())
 
         async def on_ready(self) -> None:
             log.info("discord connected as %s (%s)", self.user, self.user.id)
@@ -1648,7 +1672,7 @@ def make_bridge(cfg: dict, state: dict):
             lines = []
             if not day.exists():
                 lines.append(f"# #{getattr(ch, 'name', ch.id)} {when:%Y-%m-%d}\n")
-            known = {self.claude_id, self.user.id} | ({self.codex.bot_id} if self.codex else set())
+            known = {self.claude_id, self.user.id} | {m.bot_id for m in self.members}
             who = msg.author.display_name + (" (bot)" if msg.author.bot and msg.author.id not in known else "")
             lines.append(f"---\n\U0001f552 **{when:%H:%M:%S} {who}**\n")  # not a heading: messages have their own
             body = msg.clean_content.strip()
@@ -1699,30 +1723,31 @@ def make_bridge(cfg: dict, state: dict):
             try:
                 n, pending, for_claude = 0, False, None
                 msgs.sort(key=lambda m: m.id)
-                codex_seen = int(self.state.get("codex", {}).get("seen_msg_id") or 0)
+                seen = {m.key: int(self.state.get(m.key, {}).get("seen_msg_id") or 0) for m in self.members}
+                commands = ("!gpt", "!halt", "!pause", "!resume", "!continue") + tuple("!" + m.key for m in self.members)
                 for msg in msgs:
-                    # Codex gets what was said while the bridge was down, like a live message.
-                    if (self.codex and self.codex.enabled and codex_seen and msg.id > codex_seen
-                            and msg.author.id != self.user.id):
-                        try:
-                            await self.codex_observe(msg)
-                        except Exception:
-                            log.exception("codex catch-up failed")
-                    is_codex = self.codex is not None and self.codex.is_codex(msg)
-                    if msg.author.id == self.user.id or (msg.author.bot and msg.author.id != self.claude_id and not is_codex):
+                    # A member gets what was said while the bridge was down, like a live message.
+                    for m in self.members:
+                        if m.enabled and seen[m.key] and msg.id > seen[m.key] and msg.author.id != self.user.id:
+                            try:
+                                await self.member_observe(m, msg)
+                            except Exception:
+                                log.exception("%s catch-up failed", m.key)
+                    member = self.member_of(msg)
+                    if msg.author.id == self.user.id or (msg.author.bot and msg.author.id != self.claude_id and not member):
                         continue
                     if not msg.author.bot and msg.author.id not in self.humans():
                         continue
-                    if (msg.content or "").strip().lower().startswith(("!gpt", "!codex", "!halt", "!pause", "!resume", "!continue")):
+                    if (msg.content or "").strip().lower().startswith(commands):
                         continue
-                    who = "Codex" if is_codex else "Claude" if msg.author.bot else self.speaker(msg)
+                    who = member.name if member else "Claude" if msg.author.bot else self.speaker(msg)
                     if not self.remember(self.tag(who, msg), self.clean(msg), msg.attachments, msg.id):
                         continue  # arrived live while the history was being read
                     n += 1
                     if await self.addressed_to_gpt(msg):
                         pending = True
                         self.target_for(msg)
-                    if (not msg.author.bot or is_codex) and self.mentions_claude(msg):
+                    if (not msg.author.bot or member) and self.mentions_claude(msg):
                         for_claude = msg
                 self.buffer.sort(key=lambda entry: entry[4])  # live messages may have been added before the old ones
                 log.info("catch-up: %d messages since the last batch; addressed to GPT: %s", n, pending)
@@ -1742,48 +1767,58 @@ def make_bridge(cfg: dict, state: dict):
                 self.loop.create_task(self.archive(msg))
             if (self.cw_wake and self.in_channel(msg)
                     and ((not msg.author.bot and msg.author.id in self.humans())
-                         or (self.codex is not None and self.codex.is_codex(msg)))
+                         or self.member_of(msg) is not None)
                     and self.mentions_claude(msg)):
                 self.loop.create_task(self.wake_claude(msg))
-            if self.codex and self.codex.enabled and self.user is not None and self.in_channel(msg):
-                try:
-                    await self.codex_observe(msg)
-                except Exception:
-                    log.exception("codex observe failed")
+            if self.user is not None and self.in_channel(msg):
+                for m in self.members:
+                    if m.enabled:
+                        try:
+                            await self.member_observe(m, msg)
+                        except Exception:
+                            log.exception("%s observe failed", m.key)
             try:
                 await self.handle(msg)
             except Exception:
                 log.exception("on_message failed")
 
-        async def codex_observe(self, msg) -> None:
-            """Feed Codex the channel like GPT gets it; the owner, Claude and GPT may call it."""
+        async def member_observe(self, member, msg) -> None:
+            """Feed a member the channel like GPT gets it; the owner, Claude, GPT and the other
+            members may call it."""
             content = (msg.content or "").strip()
             if msg.author.id == self.user.id:
-                if content.startswith(("**[Codex]**", "\u2699")) or content in self.notes:
-                    return  # Codex's fallback posts, bridge control messages and bridge notices
+                if content.startswith("\u2699") or content in self.notes:
+                    return  # bridge control messages and bridge notices
+                if content.startswith(member.prefix):
+                    return  # its own fallback posts
+                other = next((m for m in self.members if content.startswith(m.prefix)), None)
                 if content in self.report_bodies:  # a background session's report: context, never a call
-                    await self.codex.observe(msg, self.tag("Report", msg), self.clean(msg), may_trigger=False)
+                    await member.observe(msg, self.tag("Report", msg), self.clean(msg), may_trigger=False)
                     return
-                speaker = "GPT"
+                speaker = other.name if other else "GPT"
             elif msg.author.id == self.claude_id:
                 speaker = S("claude_label")
             elif msg.author.bot:
-                return
+                other = self.member_of(msg)
+                if other is None or other is member:
+                    return
+                speaker = other.name
             elif msg.author.id in self.humans():
                 if content.startswith("!"):
                     return
                 speaker = self.speaker(msg)
             else:
                 return
-            await self.codex.observe(msg, self.tag(speaker, msg), self.clean(msg), may_trigger=True)
+            await member.observe(msg, self.tag(speaker, msg), self.clean(msg), may_trigger=True)
 
         async def handle(self, msg) -> None:
             if not self.in_channel(msg) or self.user is None or msg.author.id == self.user.id:
                 return
             if msg.author.bot:
-                who = "Codex" if self.codex and self.codex.is_codex(msg) else "Claude"
-                if msg.author.id != self.claude_id and who != "Codex":
+                member = self.member_of(msg)
+                if msg.author.id != self.claude_id and member is None:
                     return
+                who = member.name if member else "Claude"
                 now = time.monotonic()
                 if now - self.last_claude_at > 5 and not self.uncapped(msg.channel):  # chunks of one reply count once
                     self.streak += 1
@@ -1808,9 +1843,10 @@ def make_bridge(cfg: dict, state: dict):
             if content.lower().startswith("!gpt"):
                 await self.command(content[4:].strip())
                 return
-            if low.startswith("!codex") and self.codex:
-                await self.note(await self.codex.command(content[6:].strip()))
-                return
+            for m in self.members:
+                if (low.split() or [""])[0] == "!" + m.key:
+                    await self.note(await m.command(content[len(m.key) + 1:].strip()))
+                    return
             self.remember(self.tag(self.speaker(msg), msg), self.clean(msg), msg.attachments, msg.id)
             if await self.addressed_to_gpt(msg):
                 log.info("human -> gpt")
@@ -2075,8 +2111,8 @@ def make_bridge(cfg: dict, state: dict):
             log.info("resumed by the user")
             await self.control(S("tag_resume"), S("resume_claude"))
             await self.note(S("resume_done"))
-            if self.codex:
-                self.codex.resume()
+            for m in self.members:
+                m.resume()
             if self.gpt_pending:
                 self.gpt_pending = False
                 self.streak, self.capped = 0, False
@@ -2139,8 +2175,12 @@ def make_bridge(cfg: dict, state: dict):
                 return
             req = self.cw_work / "restart.request"
             if req.exists():
+                try:  # "resume" in the file: same conversation (after a model or effort switch)
+                    resume = req.read_text(encoding="utf-8-sig").strip().lower() == "resume"
+                except OSError:
+                    resume = False
                 req.unlink(missing_ok=True)
-                await self.restart_claude()
+                await self.restart_claude(resume=resume)
                 return
             for e in self._cw_read():
                 if e.get("type") != "assistant":
@@ -2168,6 +2208,9 @@ def make_bridge(cfg: dict, state: dict):
             if self.cw_idle_s and now - self.cw_idle_checked >= 300:
                 self.cw_idle_checked = now
                 await self.stop_idle_claude()
+            if self.cw_progress_s and now - self.cw_progress_checked >= 60:
+                self.cw_progress_checked = now
+                await self.progress_check(now)
             if self.cw_paused_until and now >= self.cw_paused_until + 60:
                 self.cw_paused_until = None
                 await self.control(S("tag_limit_over"), S("limit_over_claude"))
@@ -2176,6 +2219,42 @@ def make_bridge(cfg: dict, state: dict):
                 self.cw_nudged_at = now
                 handoff, restart = self.cw_work / "handoff.md", self.cw_work / "restart.request"
                 await self.control(S("tag_context"), S("ctx_claude", k=self.cw_ctx // 1000, handoff=handoff, restart=restart))
+
+        def in_progress(self) -> list[str]:
+            """The items under the status board's in-progress heading (claude_watch.progress_heading)."""
+            if not STATUS_FILE.exists():
+                return []
+            w = self.cfg.get("claude_watch", {})
+            heading = w.get("progress_heading", "In progress").strip().lower()
+            empty = {x.lower() for x in w.get("progress_empty", ["none", "nothing", "-"])}  # an item that means "nothing"
+            items, inside = [], False
+            for line in STATUS_FILE.read_text(encoding="utf-8", errors="replace").splitlines():
+                bare = line.strip().strip("*#: ").strip().lower()
+                if line.strip().startswith(("**", "#")):
+                    inside = bare == heading
+                    continue
+                item = line.strip().lstrip("-*• ").strip()
+                if inside and item and item.lower() not in empty:
+                    items.append(item)
+            return items
+
+        async def progress_check(self, now: float) -> None:
+            """While the status board lists work in progress and Claude has been quiet for
+            claude_watch.progress_check_min, ask it to check on that work and carry on, so the
+            user does not have to. Nothing is sent while the board shows nothing in progress."""
+            if (self.halted or self.waking or self.cw_paused_until or now - self.cw_progress_sent < self.cw_progress_s
+                    or (self.cw_work / "restart.request").exists()):
+                return
+            f = self._cw_find()
+            if f is None or now - f.stat().st_mtime < self.cw_progress_s:
+                return  # no session yet, or Claude was active recently
+            items = self.in_progress()
+            if not items or not await self.claude_running():
+                return
+            self.cw_progress_sent = now
+            log.info("progress check: Claude quiet for %d min with %d items in progress",
+                     (now - f.stat().st_mtime) // 60, len(items))
+            await self.control(S("tag_progress"), S("progress_claude", min=int(self.cw_progress_s // 60)))
 
         async def claude_running(self) -> bool:
             name = (self.cw_name or "").replace("'", "''")  # only this project's session counts
@@ -2358,19 +2437,27 @@ def make_bridge(cfg: dict, state: dict):
                 lines = [f"[{self.speaker(m)}] {(t or self.clean(m))[:300]}" for m, t in missed[-5:]]
                 await self.control(S("tag_handoff"), S("missed_claude", text="\n".join(lines)))
 
-        async def restart_claude(self) -> None:
-            """Fresh Claude session on request: stop the old one, start a new one, hand over."""
+        async def restart_claude(self, resume: bool = False) -> None:
+            """Claude restart on request: stop the old session and start a fresh one that reads the
+            handoff, or (resume) the same conversation again, e.g. on another model or effort."""
             self.waking = True  # a mention meanwhile must not start a second session; it is handed over after
             try:
-                await self._restart_claude()
+                await self._restart_claude(resume)
                 await self.flush_missed()
             finally:
                 self.waking = False
                 self.wake_missed = []
 
-        async def _restart_claude(self) -> None:
+        def claude_setting(self) -> str:
+            """Model and effort Claude starts with: <runtime>/claude-model.json, else the profile."""
+            c = self.cfg.get("claude", {})
+            over = load_json(self.cw_work / "claude-model.json", {})
+            return f"model {over.get('model') or c.get('model') or 'sonnet'}, effort {over.get('effort') or c.get('effort') or 'default'}"
+
+        async def _restart_claude(self, resume: bool = False) -> None:
             handoff = self.cw_work / "handoff.md"
-            await self.note(S("restart_start"), log_channel=True)
+            session = self.cw_file.stem if resume and self.cw_file else None
+            await self.note(S("restart_resume", setting=self.claude_setting()) if session else S("restart_start"), log_channel=True)
             name = self.cw_name.replace("'", "''")
             ps = ("Get-CimInstance Win32_Process | Where-Object { $_.Name -eq 'claude.exe' -and $_.CommandLine -match '--channels' "
                   f"-and $_.CommandLine -match [regex]::Escape('{name}') }} | ForEach-Object {{ Stop-Process -Id $_.ProcessId -Force }}; "
@@ -2383,15 +2470,22 @@ def make_bridge(cfg: dict, state: dict):
                        "ForEach-Object { Stop-Process -Id $_.ProcessId -Force }; ")
             if self.cw_lock:
                 ps += f"Remove-Item '{self.cw_lock}' -ErrorAction SilentlyContinue; "
-            self.cw_last_session.unlink(missing_ok=True)  # a fresh session, not a resumed one
+            if session:  # the launcher resumes this conversation once
+                self.cw_last_session.write_text(session, encoding="utf-8")
+            else:
+                self.cw_last_session.unlink(missing_ok=True)  # a fresh session, not a resumed one
             ps += self.cw_ensure
             proc = await asyncio.create_subprocess_exec("powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps)
             await proc.wait()
             self.cw_file, self.cw_ctx, self.cw_nudged_at = None, 0, time.time()
             self.cw_boot_check_at = time.time() + 120
             await asyncio.sleep(45)  # the new session needs a moment to connect to Discord
-            await self.control(S("tag_handoff"), S("handoff_claude", handoff=handoff))
-            log.info("Claude restarted as a fresh session")
+            if session:
+                await self.control(S("tag_switched"), S("switched_claude", setting=self.claude_setting()))
+                log.info("Claude restarted in conversation %s (%s)", session, self.claude_setting())
+            else:
+                await self.control(S("tag_handoff"), S("handoff_claude", handoff=handoff))
+                log.info("Claude restarted as a fresh session")
 
         async def worker(self) -> None:
             await self.wait_until_ready()
@@ -2529,8 +2623,9 @@ def make_bridge(cfg: dict, state: dict):
         async def post_reply(self, text: str, finished: bool, outputs: list[Path] = (), channel=None) -> None:
             channel = channel or self.channel
             text = re.sub(r"@(?:bot)?claude\b", f"<@{self.claude_id}>", text, flags=re.I)
-            if self.codex and self.codex.enabled:
-                text = re.sub(r"@(?:bot)?codex\b", f"<@{self.codex.bot_id}>", text, flags=re.I)
+            for m in self.members:
+                if m.enabled:
+                    text = m.mention_re.sub(f"<@{m.bot_id}>", text)
             text = fence_tables(text)
             text = text.replace("\u2699\ufe0f", "").replace("\u2699", "")  # only the bridge writes control messages
             text = re.sub(r"@(everyone|here)\b", "@​\\1", text)
@@ -2705,8 +2800,8 @@ def make_bridge(cfg: dict, state: dict):
                 await asyncio.sleep(3)
 
         async def close(self) -> None:
-            if self.codex:
-                await self.codex.close()
+            for m in self.members:
+                await m.close()
             try:
                 await self.gpt.shutdown()
             except Exception:
@@ -2771,8 +2866,7 @@ def run_check() -> None:
     """Dry check of a profile: what would be used and what is missing. Starts no browser and
     no Discord connection; it only tries the single-instance lock to see if a bridge is running."""
     cfg = load_config()
-    codex = cfg.get("codex", {})
-    codex_token = Path(os.path.expanduser(codex["token_file"])) if codex.get("token_file") else (ROOT if PROFILE is None else RUNTIME) / "codex-bot.env"
+    members = {k: cfg.get(k, {}) for k in ("codex", "gemini")}
     w = cfg.get("claude_watch", {})
     rows = [
         ("config", CONFIG_FILE, CONFIG_FILE.is_file()),
@@ -2786,9 +2880,11 @@ def run_check() -> None:
         ("status", STATUS_FILE, None),
         ("reports", REPORTS_DIR, None),
     ]
-    if codex.get("enabled"):
-        rows += [("codex token file", codex_token, codex_token.is_file()),
-                 ("codex workdir", Path(os.path.expanduser(codex.get("workdir") or ".")), None)]
+    for key, m in members.items():
+        if m.get("enabled"):
+            token = Path(os.path.expanduser(m["token_file"])) if m.get("token_file") else (ROOT if PROFILE is None else RUNTIME) / f"{key}-bot.env"
+            rows += [(f"{key} token file", token, token.is_file()),
+                     (f"{key} workdir", Path(os.path.expanduser(m.get("workdir") or ".")), None)]
     ok = True
     for name, p, must in rows:
         exists = p.exists()
@@ -2814,7 +2910,8 @@ def run_check() -> None:
             ok = False
             print(f"string {key} does not format: {e}")
     print(f"channel {cfg.get('channel_id')} log {cfg.get('log_channel_id') or '-'}; session \"{w.get('session_name') or cfg.get('claude', {}).get('name', '')}\"; "
-          f"codex {'on' if codex.get('enabled') else 'off'}; idle stop {w.get('idle_stop_min', 0)} min; "
+          + "".join(f"{k} {'on' if m.get('enabled') else 'off'}; " for k, m in members.items()) +
+          f"idle stop {w.get('idle_stop_min', 0)} min; "
           f"wake on mention {bool(w.get('ensure_script') or w.get('wake_on_mention'))}; archive {cfg.get('archive_dir') or '-'}")
     lock = acquire_lock() if DATA.is_dir() else "free"
     print("bridge lock:", "free" if lock else "HELD (a bridge is running on this profile)")

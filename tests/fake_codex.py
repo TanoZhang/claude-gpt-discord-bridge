@@ -34,6 +34,10 @@ elif scenario == "cut_then_ok" and len(calls) == 1:
     emit(type="turn.started")
     message("working on it")
     sys.exit(0)  # ends without turn.completed
+elif scenario == "switch":
+    emit(type="turn.started")
+    message("ok [[effort:high]]")
+    emit(type="turn.completed", usage={})
 else:
     emit(type="turn.started")
     message("final answer")

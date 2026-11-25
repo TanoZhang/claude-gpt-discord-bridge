@@ -53,5 +53,24 @@
     "disable_features": []
   },
 
+  "gemini": {
+    "enabled": false,
+    "workdir": "C:\\path\\to\\your\\project",
+    "bot_id": "000000000000000000",
+    "token_file": "",
+    "executable": "",
+    "permissions": "auto",
+    "model": "",
+    "models": {"easy": "gemini-4-hydrogen-high", "medium": "gemini-4-neon-high", "hard": "gemini-4-carbon-high"},
+    "router_model": "",
+    "router_fallback": "medium",
+    "effort": "",
+    "context_max_chars": 20000,
+    "rotate_turns": 40,
+    "stall_timeout_s": 1800,
+    "turn_timeout_s": 10800,
+    "retries": 1
+  },
+
   "strings": {}
 }

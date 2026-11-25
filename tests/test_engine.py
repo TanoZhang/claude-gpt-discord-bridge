@@ -1,7 +1,7 @@
 """Offline tests for the parts of the bridge where messages used to get lost.
 
-No Discord connection, no browser, no real Codex: the Discord client is constructed but never
-logged in, and Codex is replaced by tests/fake_codex.py. Run with the bridge's Python:
+No Discord connection, no browser, no real Codex or agy: the Discord client is constructed but never
+logged in, and Codex and agy are replaced by tests/fake_codex.py and tests/fake_agy.py. Run with the bridge's Python:
 
     python tests/test_engine.py
 """
@@ -20,6 +20,8 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "bridge"))
 import gpt_bridge as gb  # noqa: E402
 import codex_agent as ca  # noqa: E402
+import cli_agent as cli  # noqa: E402
+import gemini_agent as ga  # noqa: E402
 
 FAILED = []
 
@@ -101,7 +103,7 @@ class FakeChannel:
         return FakeSent(1000 + len(self.sent))
 
     def typing(self):
-        return ca._Null()
+        return cli._Null()
 
 
 async def test_web_turns(tmp: Path) -> None:
@@ -422,7 +424,7 @@ class FakeMsg:
 
 
 class FakeBridge:
-    channel_id, log_channel_id, halted, streak, cap, claude_id, user = 1, 2, None, 0, 4, 20, None
+    channel_id, log_channel_id, halted, streak, cap, claude_id, user, owner_id = 1, 2, None, 0, 4, 20, None, 10
 
     def __init__(self):
         self.channel = FakeChannel()
@@ -550,11 +552,228 @@ async def test_codex_runs(tmp: Path) -> None:
     check("codex: the stall is reported", any("Codex" in (x or "") for x in agent.bridge.channel.sent), str(agent.bridge.channel.sent))
 
 
+# ------------------------------------------------------------------ Gemini (Antigravity CLI)
+
+MODELS = {"easy": "gemini-4-hydrogen-high", "medium": "gemini-4-neon-high", "hard": "gemini-4-carbon-high"}
+
+
+def make_gemini(tmp: Path, scenario: str, **extra):
+    fake = tmp / "agy.cmd"
+    fake.write_text(f'@echo off\r\n"{sys.executable}" "{ROOT / "tests" / "fake_agy.py"}" "{tmp}" {scenario} %*\r\n', encoding="ascii")
+    cfg = {"quiet_period_s": 0, "gemini": {"enabled": True, "bot_id": "40", "workdir": str(tmp), "executable": str(fake),
+                                           "retries": 1, "models": dict(MODELS), **extra}}
+    helpers = {"split_message": gb.split_message, "fence_tables": gb.fence_tables, "outbox": tmp / "outbox",
+               "root": tmp, "S": gb.S}
+    agent = ga.GeminiAgent(FakeBridge(), None, cfg, {}, lambda: None, logging.getLogger("test"), helpers)
+    agent.discord = type("D", (), {"AllowedMentions": lambda **kw: None, "File": None})
+    return agent
+
+
+async def gemini_turn(agent, request="@Gemini do it", timeout=60):
+    agent.remember("User", request)
+    agent.s["request"] = request
+    agent.pending = True
+    agent.trigger.set()
+    await run_one_turn(agent, timeout)
+    return json.loads((Path(agent.workdir) / "calls.json").read_text())
+
+
+def arg(call, flag):
+    a = call["args"]
+    return a[a.index(flag) + 1] if flag in a else None
+
+
+async def test_gemini_routing(tmp: Path) -> None:
+    for rating, want in (("easy", "hydrogen"), ("medium", "neon"), ("hard", "carbon")):
+        d = tmp / rating; d.mkdir()
+        agent = make_gemini(d, f"{rating}_ok")
+        calls = await gemini_turn(agent)
+        check(f"gemini: the request is rated by the cheap model first ({rating})",
+              len(calls) == 2 and "Rate how hard" in calls[0]["stdin"] and arg(calls[0], "--model") == MODELS["easy"],
+              str([c["args"] for c in calls]))
+        check(f"gemini: the rating run gets no permissions ({rating})", calls and "--mode" not in calls[0]["args"]
+              and "--dangerously-skip-permissions" not in calls[0]["args"], str(calls[0]["args"] if calls else ""))
+        check(f"gemini: a {rating} request runs on {want}", len(calls) == 2 and want in (arg(calls[1], "--model") or ""),
+              str(calls[-1]["args"]))
+        check(f"gemini: the answer is posted ({rating})", agent.bridge.channel.sent[-1:] == ["**[Gemini]** final answer"],
+              str(agent.bridge.channel.sent))
+
+    d = tmp / "named"; d.mkdir()
+    agent = make_gemini(d, "easy_ok")
+    calls = await gemini_turn(agent, "@Gemini carbon refactor the parser")
+    check("gemini: a model named in the request is used without rating", len(calls) == 1
+          and arg(calls[0], "--model") == MODELS["hard"], str([c["args"] for c in calls]))
+
+    d = tmp / "tier"; d.mkdir()
+    agent = make_gemini(d, "easy_ok")
+    calls = await gemini_turn(agent, "@Gemini medium: look at this")
+    check("gemini: a tier named in the request is used", len(calls) == 1 and arg(calls[0], "--model") == MODELS["medium"],
+          str([c["args"] for c in calls]))
+
+    d = tmp / "fixed"; d.mkdir()
+    agent = make_gemini(d, "easy_ok", model="gemini-4-argon-high")
+    calls = await gemini_turn(agent)
+    check("gemini: a fixed model skips the rating", len(calls) == 1 and arg(calls[0], "--model") == "gemini-4-argon-high",
+          str([c["args"] for c in calls]))
+
+    d = tmp / "junk"; d.mkdir()
+    agent = make_gemini(d, "junk_ok")
+    calls = await gemini_turn(agent)
+    check("gemini: an unusable rating falls back to medium", arg(calls[-1], "--model") == MODELS["medium"],
+          str(calls[-1]["args"]))
+
+    agent = make_gemini(tmp, "easy_ok")
+    check("gemini: a model word must follow the mention",
+          agent.named_model("@Gemini please look at the carbon tax module later") is None)
+
+
+async def test_gemini_runs(tmp: Path) -> None:
+    # 1. permissions, prompt on stdin, conversation resumed on the next turn, token count
+    d = tmp / "ok"; d.mkdir()
+    agent = make_gemini(d, "easy_ok", permissions="skip")
+    calls = await gemini_turn(agent)
+    main = calls[-1]
+    check("gemini: 'skip' allows everything", "--dangerously-skip-permissions" in main["args"], str(main["args"]))
+    line = json.loads(main["stdin"].splitlines()[0]) if main["stdin"].strip() else {}
+    check("gemini: the prompt goes in on stdin as a stream-json user event",
+          line.get("event") == "user" and "do it" in line.get("message", {}).get("content", ""), main["stdin"][:120])
+    check("gemini: the prompt is not on the command line", not any("do it" in a for a in main["args"]))
+    check("gemini: the conversation id is kept", agent.s.get("thread") == "conv-1", str(agent.s.get("thread")))
+    calls = await gemini_turn(agent, "@Gemini and now this")
+    check("gemini: the next turn resumes the conversation", arg(calls[-1], "--conversation") == "conv-1",
+          str(calls[-1]["args"]))
+    check("gemini: a resumed turn does not resend the intro", "Antigravity" not in calls[-1]["stdin"])
+    check("gemini: router and turn tokens are counted", agent.s.get("tokens_total") == 240, str(agent.s.get("tokens_total")))
+    status = await agent.command("status")
+    check("gemini: status names the last model", MODELS["easy"] in status, status)
+
+    d = tmp / "default"; d.mkdir()
+    agent = make_gemini(d, "easy_ok")
+    calls = await gemini_turn(agent)
+    check("gemini: the default permission mode is auto", arg(calls[-1], "--mode") == "auto", str(calls[-1]["args"]))
+
+    # 2. a conversation that cannot be resumed: a new one, with the full prompt
+    d = tmp / "lost"; d.mkdir()
+    agent = make_gemini(d, "easy_lost", model="m")
+    agent.s.update(thread="old-conv", turns=1)
+    calls = await gemini_turn(agent)
+    check("gemini: a lost conversation is started again", len(calls) == 2 and "--conversation" not in calls[1]["args"],
+          str([c["args"] for c in calls]))
+    check("gemini: the new conversation gets the intro", len(calls) == 2 and "Antigravity" in calls[1]["stdin"])
+    check("gemini: the stray conversation agy opened silently is not kept", agent.s.get("thread") != "conv-stray")
+    check("gemini: the answer from the new conversation is posted",
+          agent.bridge.channel.sent[-1:] == ["**[Gemini]** final answer"], str(agent.bridge.channel.sent))
+    check("gemini: the new conversation is kept", agent.s.get("thread") == "conv-2", str(agent.s.get("thread")))
+
+    # 3. quota used up: reported, not retried, messages kept
+    d = tmp / "quota"; d.mkdir()
+    agent = make_gemini(d, "easy_quota", model="m")
+    calls = await gemini_turn(agent)
+    check("gemini: a quota error is not retried", len(calls) == 1, str(len(calls)))
+    sent = agent.bridge.channel.sent
+    check("gemini: a quota error is reported as a limit", sent and "limit" in sent[-1] and "Gemini" in sent[-1], str(sent))
+    check("gemini: the messages are kept after a quota error", len(agent.s["buffer"]) == 1)
+
+    # 4. files the reply names are attached only from the outbox or the workdir
+    d = tmp / "files"; d.mkdir()
+    agent = make_gemini(d, "easy_ok")
+    (d / "outbox").mkdir()
+    good = d / "outbox" / "plot.png"
+    good.write_bytes(b"x")
+    text, files = agent.outputs(f"see [[discord-file:{good}]] and [[discord-file:C:\\Windows\\win.ini]]")
+    check("gemini: an outbox file is attached and the marker removed", files == [good.resolve()] and "discord-file" not in text,
+          f"{files} {text!r}")
+
+    # 5. other members' @Name become real mentions
+    agent = make_gemini(d, "easy_ok")
+    codex = make_codex(d, "ok")
+    agent.bridge.members = [agent, codex]
+    check("gemini: @Codex in a reply mentions the Codex bot", "<@30>" in agent.link_mentions("@Codex please review"))
+
+
+async def test_switching(tmp: Path) -> None:
+    # 1. a reply in a turn the owner asked for switches the member from its next turn
+    d = tmp / "gem"; d.mkdir()
+    agent = make_gemini(d, "easy_switch", model="gemini-4-hydrogen-high")
+    agent.remember("User", "@Gemini switch to xhigh effort")
+    agent.s.update(request="@Gemini switch to xhigh effort", by_owner=True)
+    agent.pending = True
+    agent.trigger.set()
+    await run_one_turn(agent)
+    calls = json.loads((d / "calls.json").read_text())
+    check("switch: the switch help is in the prompt when the request talks about it",
+          "[[effort:" in calls[0]["stdin"], calls[0]["stdin"][:200])
+    sent = agent.bridge.channel.sent
+    check("switch: the markers are removed from the posted reply", sent and "[[" not in sent[0], str(sent))
+    check("switch: the change is announced", sent and "xhigh" in sent[-1], str(sent))
+    check("switch: model and effort are kept", agent.current_model() == "gemini-4-hydrogen-low"
+          and agent.current_effort() == "xhigh", f"{agent.current_model()} {agent.current_effort()}")
+    calls = await gemini_turn(agent, "@Gemini go on")
+    check("switch: the next run uses them", arg(calls[-1], "--model") == "gemini-4-hydrogen-low"
+          and arg(calls[-1], "--effort") == "xhigh", str(calls[-1]["args"]))
+
+    # 2. the same reply in a turn someone else asked for changes nothing
+    d = tmp / "gem2"; d.mkdir()
+    agent = make_gemini(d, "easy_switch", model="gemini-4-hydrogen-high")
+    agent.remember("Codex", "@Gemini switch to xhigh")
+    agent.s.update(request="@Gemini switch to xhigh", by_owner=False)
+    agent.pending = True
+    agent.trigger.set()
+    await run_one_turn(agent)
+    check("switch: only the owner can make a member switch", agent.current_model() == "gemini-4-hydrogen-high"
+          and not agent.current_effort(), f"{agent.current_model()} {agent.current_effort()}")
+    check("switch: the refusal is said", "owner" in (agent.bridge.channel.sent or [""])[-1], str(agent.bridge.channel.sent))
+
+    # 3. owner commands, a bad effort, back to default
+    note = await agent.command("effort turbo")
+    check("switch: an unknown effort is refused", "turbo" in note and not agent.current_effort(), note)
+    await agent.command("effort low")
+    await agent.command("model gemini-3.8-flash-low")
+    check("switch: !gemini model/effort set them", agent.current_model() == "gemini-3.8-flash-low"
+          and agent.current_effort() == "low")
+    await agent.command("model default")
+    check("switch: 'default' returns to the config", agent.current_model() == "gemini-4-hydrogen-high")
+    check("switch: status shows model and effort", "low" in await agent.command("status"))
+
+    # 4. Codex: effort goes in as a config override, model as -m
+    d = tmp / "codex"; d.mkdir()
+    codex = make_codex(d, "switch")
+    codex.remember("User", "@Codex use high effort")
+    codex.s.update(request="@Codex use high effort", by_owner=True)
+    codex.pending = True
+    codex.trigger.set()
+    await run_one_turn(codex)
+    check("switch: Codex switched its effort", codex.current_effort() == "high", codex.current_effort())
+    await codex.command("model gpt-test")
+    args = codex.command_args(None)
+    check("switch: Codex runs get -m and the effort override", "gpt-test" in args
+          and 'model_reasoning_effort="high"' in args, str(args))
+
+    # 5. a mention inside backticks becomes a real mention
+    codex.bridge.members = [codex, agent]
+    check("switch: backticks around a mention are dropped", codex.link_mentions("ask `@BotGemini` and `@Claude`")
+          == f"ask <@40> and <@20>", codex.link_mentions("ask `@BotGemini` and `@Claude`"))
+
+
+async def test_progress_board(tmp: Path) -> None:
+    b = make_bridge(tmp, claude_watch={"progress_heading": "Doing", "progress_empty": ["nil"]})
+    gb.STATUS_FILE = tmp / "status.md"
+    gb.STATUS_FILE.write_text("**Doing**\n- rerun the strategy, results at 20:50\n- Gemini checks the list\n\n**Done**\n- other\n\n**Decide**\nnil\n",
+                              encoding="utf-8")
+    check("progress: the in-progress items are read", b.in_progress() == ["rerun the strategy, results at 20:50", "Gemini checks the list"],
+          str(b.in_progress()))
+    gb.STATUS_FILE.write_text("**Doing**\nnil\n\n**Done**\n- other\n", encoding="utf-8")
+    check("progress: a configured empty word means nothing in progress", b.in_progress() == [], str(b.in_progress()))
+    await b.close()
+
+
 async def main() -> None:
     logging.basicConfig(level=logging.CRITICAL)
     with tempfile.TemporaryDirectory() as t:
         tmp = Path(t)
-        for i, test in enumerate((test_buffer, test_halt, test_web_turns, test_mirror_rules, test_page_loads, test_reports, test_codex_buffer, test_codex_runs)):
+        for i, test in enumerate((test_buffer, test_halt, test_web_turns, test_mirror_rules, test_page_loads, test_reports, test_codex_buffer, test_codex_runs,
+                                  test_gemini_routing, test_gemini_runs,
+                                  test_switching, test_progress_board)):
             d = tmp / str(i)
             d.mkdir()
             try:

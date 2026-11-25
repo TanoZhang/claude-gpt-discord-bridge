@@ -123,6 +123,8 @@ The official plugin (`discord@claude-plugins-official`) ignores every message fr
 | `!gpt cap <n>` | Change the loop cap |
 | `!gpt show` / `!gpt hide` | Show the browser to log in or pass a check, then hide it |
 | `@Codex …` / `!codex status\|stop\|new` | Ask Codex / its state, stop its current turn, start a new Codex session (only with `codex` enabled) |
+| `@Gemini …` / `!gemini status\|stop\|new` | The same for Gemini (only with `gemini` enabled) |
+| `!codex model <name>` / `!codex effort <level>` (and `!gemini …`) | Switch that member's model or effort from its next turn; `default` returns to the config |
 | `!halt` / `!resume` | Pause the group (GPT quiet, Claude stops after its current step) / continue |
 
 Stop or restart: `scripts\stop.ps1 [-Restart]`. A restarted Claude session starts fresh; `scripts\launch-claude.ps1 -Resume <session-id>` continues an old one.
@@ -144,6 +146,7 @@ Stop or restart: `scripts\stop.ps1 [-Restart]`. A restarted Claude session start
 | `archive_dir` | `""` | Folder for a local Markdown copy of the channels (`<channel>/<date>.md`, attachments in `files/`); empty = no archive |
 | `claude_watch.ensure_script` | `""` | PowerShell script that starts Claude; when set, an @Claude while no session runs starts one (Windows) |
 | `codex` | disabled | Optional Codex member, see below |
+| `gemini` | disabled | Optional Gemini (Antigravity CLI) member, see below |
 | `intro` / `handoff_prompt` | English | What GPT is told about the group, and how it is asked for a summary |
 | `strings` | `{}` | Override or translate any message the bridge posts |
 | `selectors` | ChatGPT as of 2026-11 | Fix these when ChatGPT's markup changes |
@@ -159,6 +162,26 @@ The bridge can add the Codex CLI as a third member. It needs the Codex CLI insta
 Codex is a group member like GPT: it receives every channel message since its own last reply (up to `codex.context_max_chars`), each with the speaker in front, but it only runs when someone writes `@Codex` (the owner, Claude or GPT). It answers in the channel where it was asked, and mentions `@Claude` or `@GPT` only when it needs them. Files it should post go to the outbox and are referenced as `[[discord-file:PATH]]`. The Codex thread is resumed between turns and renewed after `codex.rotate_turns` turns. If the Codex bot cannot log in, its replies are posted by the GPT bot with a `[Codex]` prefix. Other options: `executable` (auto-detected when empty), `sandbox` (`workspace-write` or `danger-full-access`), `network`, and `intro` to replace the default instructions.
 
 Owner commands: `!codex status`, `!codex stop` (kill the current turn), `!codex new` (start a fresh Codex session next time). `!halt` pauses Codex too.
+
+## Gemini (optional)
+
+Gemini joins the same way through the Antigravity CLI (`agy`), as a fourth member with its own bot. Install the CLI (`irm https://antigravity.google/cli/install.ps1 | iex`), run `agy` once to sign in, and see which models your plan offers with `agy models`.
+
+1. Put the Gemini bot's token in `gemini-bot.env` (`GEMINI_DISCORD_BOT_TOKEN=...`) or point `gemini.token_file` at another file.
+2. Set `gemini.enabled`, `gemini.workdir` and `gemini.bot_id`, and add the bot's id to `allowFrom` in the Discord plugin's `access.json` so Claude hears it.
+3. Restart the bridge (and Claude, so it lets the new bot's messages through).
+
+It behaves like Codex: `@Gemini` (or a reply to its message) starts a turn, the conversation is resumed between turns and renewed after `gemini.rotate_turns`, and the prompt goes to `agy` on stdin. Before each turn the cheapest model rates the request as easy, medium or hard (`router_model`, default `models.easy`; a run of a few hundred tokens), and the turn runs on `models.<rating>`. `@Gemini carbon …` or `@Gemini hard: …` names the model or tier directly, and `gemini.model` fixes one model for every turn. `gemini.permissions` is `auto` by default; `skip` passes `--dangerously-skip-permissions`, any other value goes to `--mode`. Token use of each run is written to the bridge log; `!gemini status` shows the last model and the totals.
+
+### Switching models and effort
+
+Codex and Gemini switch their own model or effort when the owner asks them to: the member writes `[[model:NAME]]` or `[[effort:LEVEL]]` in its reply, and the bridge removes the marker, applies it from the member's next turn and says so in the channel. Only a turn the owner asked for can switch; the owner can also type the `!codex` / `!gemini` commands above. The choice is kept in the bridge state until it is changed again.
+
+Claude switches by writing `<runtime_dir>/claude-model.json` (`{"model": "...", "effort": "..."}`) and the word `resume` into `restart.request`: the bridge restarts it in the same conversation, and `scripts/launch-claude.ps1` passes the new `--model` / `--effort` (`claude.effort` sets a default effort).
+
+### Progress checks
+
+With `claude_watch.progress_check_min` set, the bridge asks Claude to check on its work and carry on whenever the status board's in-progress section (`claude_watch.progress_heading`, default `In progress`) lists something and nobody has moved for that many minutes. Nothing is sent while that section is empty.
 
 ## Caveats
 
@@ -187,5 +210,5 @@ Give each project its own profile: a JSON file with the same keys as `config.jso
 - `scripts/status.ps1 [-Profile a.json]` shows what is running and the end of the bridge log.
 - `codex.disable_features` turns Codex feature flags off for the bridge's runs (see `codex features list`); each unused feature costs context on every model call. `["apps", "plugins", "computer_use", "browser_use", "image_generation", "multi_agent", "goals", "realtime_conversation"]` cut the fixed context by about a third with codex-cli 0.167. A request that was pending or running when the bridge stopped runs again after the restart.
 - Web mirror: turns typed in ChatGPT itself are looked for every `mirror_interval_s`; after one is found, every `mirror_fast_s` (0 = off) for `mirror_fast_for_s` seconds. They are also posted right before each batch from the channel is sent, so a later channel message never skips them.
-- `python tests/test_engine.py` runs offline tests of the message paths (buffering, catch-up order, web mirror position, reports queue, Codex retry and timeouts) with a fake Codex; no Discord, browser or Codex account is used.
+- `python tests/test_engine.py` runs offline tests of the message paths (buffering, catch-up order, web mirror position, reports queue, Codex retry and timeouts, Gemini model choice and resume) with a fake Codex and a fake `agy`; no Discord, browser, Codex or Google account is used.
 - Codex runs are stopped after `codex.stall_timeout_s` without output or `codex.turn_timeout_s` in total, and a failed run is retried `codex.retries` times, continuing its thread when there is one.

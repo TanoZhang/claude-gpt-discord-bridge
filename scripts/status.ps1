@@ -7,11 +7,13 @@ if (-not $cfg) { exit 1 }
 $bridge = @(Find-Bridge)
 $claude = @(Find-Claude)
 $codex  = @()
+$gemini = @()
 if ($bridge) {
-  # Codex runs as a child of the bridge only while it works on a turn.
+  # Codex and agy run as children of the bridge only while they work on a turn.
   $all = Get-CimInstance Win32_Process
   $ids = @($bridge | ForEach-Object { $_.ProcessId })
   $codex = @($all | Where-Object { $_.Name -eq 'codex.exe' -and $ids -contains $_.ParentProcessId })
+  $gemini = @($all | Where-Object { $_.Name -like 'agy*' -and $ids -contains $_.ParentProcessId })
 }
 function Since($p) { if ($p) { ' since ' + ($p | Sort-Object CreationDate | Select-Object -First 1).CreationDate.ToString('MM-dd HH:mm') } else { '' } }
 
@@ -19,6 +21,7 @@ Write-Output ("Project : {0}" -f $(if ($profilePath) { $profilePath } else { $co
 Write-Output ("Bridge  : {0}{1}" -f $(if ($bridge) { 'running' } else { 'STOPPED' }), (Since $bridge))
 Write-Output ("Claude  : {0}{1}  (session `"{2}`")" -f $(if ($claude) { 'running' } else { 'not running (starts at the next @Claude)' }), (Since $claude), $sessionName)
 Write-Output ("Codex   : {0}" -f $(if (-not $cfg.codex.enabled) { 'off' } elseif ($codex) { 'working on a turn' } else { 'idle' }))
+Write-Output ("Gemini  : {0}" -f $(if (-not $cfg.gemini.enabled) { 'off' } elseif ($gemini) { 'working on a turn' } else { 'idle' }))
 $log = Join-Path $data 'logs\bridge.log'
 if (Test-Path -LiteralPath $log) {
   Write-Output ("Log     : {0}" -f $log)
