@@ -24,6 +24,8 @@ RESUME_LOST_RE = re.compile(r"not found|no (such )?(session|thread|rollout|conve
 NO_WINDOW = 0x08000000 if os.name == "nt" else 0
 # In a reply: [[model:NAME]] / [[effort:LEVEL]] switches the member from its next turn ("default" = the config's).
 SWITCH_RE = re.compile(r"\[\[(model|effort):\s*([^\]\s]+)\s*\]\]", re.I)
+NEW_SESSION_RE = re.compile(r"\[\[new-session\]\]", re.I)  # in a reply: a fresh session from the next turn
+HELP_VERSION = 1  # raise when switch_help / session_help change: running sessions get them once more
 
 
 def read_token(path: Path, var: str) -> str:
@@ -117,7 +119,8 @@ class CliAgent:
     def switch_help(self) -> str:
         return self.t("switch_help", model=self.current_model() or self.t("default_value"),
                       effort=self.current_effort() or self.t("default_value"),
-                      efforts=", ".join(self.efforts), models=self.models_hint, user=self.S("user_label"))
+                      efforts=", ".join(self.efforts) or "-", models=self.models_hint, user=self.S("user_label"),
+                      premium=", ".join(sorted(self.premium())) or "-")
 
     @property
     def token_file(self) -> Path:
@@ -289,11 +292,17 @@ class CliAgent:
             parts.append(intro.format(workdir=self.workdir, outbox=self.outbox,
                                       user=S("user_label"), claude=S("claude_label")))
             parts.append(self.switch_help())
+            parts.append(self.t("session_help"))
+            self.s["help_version"] = HELP_VERSION
             recent = self.s.get("recent", [])
             if recent:
                 parts.append(self.t("recent_header") + "\n" + "\n---\n".join(recent))
+        elif self.s.get("help_version") != HELP_VERSION:  # a session that started before these rules
+            parts.append(self.switch_help())
+            parts.append(self.t("session_help"))
+            self.s["help_version"] = HELP_VERSION
         elif re.search(self.t("model_words"), self.s.get("request") or "", re.I):
-            parts.append(self.switch_help())  # the session may predate the switch help
+            parts.append(self.switch_help())
         parts.append(self.t("context_header") + "\n" + context)
         if files:
             parts.append(self.t("files_header") + "\n" + "\n".join(str(p) for p in files))
@@ -380,6 +389,9 @@ class CliAgent:
         if thread and int(self.s.get("turns", 0)) >= int(self.cfg.get("rotate_turns", 40)):
             self.log.info("%s: %s turns in the session, starting a new one", self.key, self.s.get("turns"))
             thread = None
+        if self.s.pop("fresh_next", False) and thread:
+            self.log.info("%s: starting a new session as it asked", self.key)
+            thread = None
         if self.stopped or self.closing:  # stopped while the attachments were downloading
             raise RuntimeError("stopped")
         tries = 1 + max(0, int(self.cfg.get("retries", 1)))
@@ -414,20 +426,34 @@ class CliAgent:
         self.s["turns"] = int(self.s.get("turns", 0)) + 1
         reply = messages[-1] if messages else self.t("empty")
         reply, notes = self.apply_switches(reply)
+        if NEW_SESSION_RE.search(reply):  # the member asks for a fresh session from its next turn
+            reply = NEW_SESSION_RE.sub("", reply).strip()
+            self.s["fresh_next"] = True
+            notes.append(self.t("session_next"))
+            self.log.info("%s: asked for a new session from its next turn", self.key)
         self.s["recent"] = (self.s.get("recent", []) + [reply[:1200]])[-3:]
         self.save()
         await self.post(target, reply + "".join("\n\n" + n for n in notes))
 
+    def premium(self) -> set[str]:
+        """Models and effort levels (config `premium`) only the owner may ask for."""
+        return {str(x).lower() for x in self.cfg.get("premium", [])}
+
     def apply_switches(self, reply: str) -> tuple[str, list[str]]:
-        """[[model:...]] / [[effort:...]] in a reply: applied only in a turn the owner asked for."""
+        """[[model:...]] / [[effort:...]] in a reply. The member picks what fits the task itself;
+        a premium model or effort only in a turn the owner asked for."""
         found = SWITCH_RE.findall(reply)
         if not found:
             return reply, []
         reply = SWITCH_RE.sub("", reply).strip()
-        if not self.s.get("by_owner"):
-            self.log.warning("%s: ignored a model/effort switch in a turn the owner did not ask for: %s", self.key, found)
-            return reply, [self.t("switch_refused")]
-        return reply, [self.switch(what, value) for what, value in found]
+        notes = []
+        for what, value in found:
+            if value.lower() in self.premium() and not self.s.get("by_owner"):
+                self.log.warning("%s: ignored a switch to premium %s %s outside an owner's turn", self.key, what, value)
+                notes.append(self.t("switch_refused", value=value))
+            else:
+                notes.append(self.switch(what, value))
+        return reply, notes
 
     # -- Discord output
     def typing(self, channel_id: int):

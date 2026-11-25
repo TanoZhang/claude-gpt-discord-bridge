@@ -207,11 +207,13 @@ DEFAULT_STRINGS = {
     "agent_usage": " Last turn: model {model} ({tier}), {last} tokens; {total} tokens since the bridge started.",
     "agent_model_line": " Model {model}, effort {effort}.",
     "agent_default_value": "default",
+    "agent_session_help": "[New sessions] Every turn re-reads your whole session, so a long one wastes quota. When your session has grown long (many turns, big files or logs read) or a big piece of work is finished and reported, write [[new-session]] in your reply: your next turn starts a fresh session that gets the intro and your last replies. Put anything the next session must know (what is done, what is open, where things are) in that reply. Do not do it in the middle of a task.",
+    "agent_session_next": "({name} starts a fresh session from its next turn.)",
     "agent_model_words": "model|effort|reasoning",  # a request matching this regex gets the switch help
-    "agent_switch_help": "[Your model and effort] You run on model {model}, effort {effort}. Only when {user} tells you to change them, write [[model:NAME]] and/or [[effort:LEVEL]] in your reply (NAME from {models}; LEVEL one of: {efforts}; \"default\" returns to the configured one). The bridge applies it from your next turn and says so in the channel; do not change any config file yourself.",
+    "agent_switch_help": "[Your model and effort] You run on model {model}, effort {effort}. Pick the model and effort that fit the task: lighter for simple work, stronger only when the work needs it. To switch, write [[model:NAME]] and/or [[effort:LEVEL]] in your reply (NAME from {models}; LEVEL one of: {efforts}; \"default\" returns to the configured one); the bridge applies it from your next turn and says so in the channel. Only when {user} asks for it: {premium}. Do not change any config file yourself.",
     "agent_switched": "({name} uses {what} {value} from its next turn.)",
     "agent_switch_bad": "({name}: {what} \"{value}\" is not one of: {choices}. Nothing changed.)",
-    "agent_switch_refused": "({name} asked to change its model or effort, but only the owner can ask for that. Nothing changed.)",
+    "agent_switch_refused": "({name} wanted {value}, which only the owner can ask for. Nothing changed.)",
     "fresh_words": "fresh",  # `!gpt new <word>`: space-separated words that mean "no handoff summary"
     "tag_pause": "[Pause]", "tag_resume": "[Resume]", "tag_limit_over": "[Limit over]",
     "tag_context": "[Context]", "tag_handoff": "[Handoff]",

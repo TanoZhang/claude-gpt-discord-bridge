@@ -712,17 +712,19 @@ async def test_switching(tmp: Path) -> None:
     check("switch: the next run uses them", arg(calls[-1], "--model") == "gemini-4-hydrogen-low"
           and arg(calls[-1], "--effort") == "xhigh", str(calls[-1]["args"]))
 
-    # 2. the same reply in a turn someone else asked for changes nothing
+    # 2. in a turn someone else asked for, the member still picks its own setting, but not a premium one
     d = tmp / "gem2"; d.mkdir()
-    agent = make_gemini(d, "easy_switch", model="gemini-4-hydrogen-high")
+    agent = make_gemini(d, "easy_switch", model="gemini-4-hydrogen-high", premium=["xhigh"])
     agent.remember("Codex", "@Gemini switch to xhigh")
     agent.s.update(request="@Gemini switch to xhigh", by_owner=False)
     agent.pending = True
     agent.trigger.set()
     await run_one_turn(agent)
-    check("switch: only the owner can make a member switch", agent.current_model() == "gemini-4-hydrogen-high"
-          and not agent.current_effort(), f"{agent.current_model()} {agent.current_effort()}")
+    check("switch: a member may pick an ordinary model itself", agent.current_model() == "gemini-4-hydrogen-low",
+          agent.current_model())
+    check("switch: a premium effort needs the owner", not agent.current_effort(), agent.current_effort())
     check("switch: the refusal is said", "owner" in (agent.bridge.channel.sent or [""])[-1], str(agent.bridge.channel.sent))
+    agent.s["model"] = None
 
     # 3. owner commands, a bad effort, back to default
     note = await agent.command("effort turbo")
@@ -767,13 +769,29 @@ async def test_progress_board(tmp: Path) -> None:
     await b.close()
 
 
+async def test_new_session(tmp: Path) -> None:
+    d = tmp / "ns"; d.mkdir()
+    agent = make_gemini(d, "easy_newsession", model="m")
+    agent.s.update(thread="conv-1", turns=3)  # a session from before the rules
+    calls = await gemini_turn(agent)
+    check("session: an old session gets the rules once", "[[new-session]]" in calls[-1]["stdin"], calls[-1]["stdin"][:200])
+    check("session: the marker is not posted", "[[" not in agent.bridge.channel.sent[0], str(agent.bridge.channel.sent))
+    check("session: the request is acknowledged", "fresh session" in agent.bridge.channel.sent[-1], str(agent.bridge.channel.sent))
+    calls = await gemini_turn(agent, "@Gemini next")
+    check("session: the next turn starts a fresh session", "--conversation" not in calls[-1]["args"], str(calls[-1]["args"]))
+    check("session: the fresh session gets the intro", "Antigravity" in calls[-1]["stdin"])
+    calls = await gemini_turn(agent, "@Gemini and again")
+    check("session: the rules are not repeated in a resumed turn", "[[new-session]]" not in calls[-1]["stdin"]
+          and "--conversation" in calls[-1]["args"], str(calls[-1]["args"]))
+
+
 async def main() -> None:
     logging.basicConfig(level=logging.CRITICAL)
     with tempfile.TemporaryDirectory() as t:
         tmp = Path(t)
         for i, test in enumerate((test_buffer, test_halt, test_web_turns, test_mirror_rules, test_page_loads, test_reports, test_codex_buffer, test_codex_runs,
                                   test_gemini_routing, test_gemini_runs,
-                                  test_switching, test_progress_board)):
+                                  test_switching, test_progress_board, test_new_session)):
             d = tmp / str(i)
             d.mkdir()
             try:

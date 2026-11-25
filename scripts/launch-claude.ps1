@@ -103,6 +103,9 @@ $cliArgs += @(
   '--add-dir', $runtime,  # handoff, status, restart and model files: no Allow click needed for them
   '--append-system-prompt-file', $prompt)
 if ($effort) { $cliArgs += @('--effort', $effort) }
+# claude.autocompact: compact the conversation at this many tokens (at least 100000, or "auto")
+# instead of switching to a fresh session; keeps the thread of the work.
+if ($c.autocompact) { $cliArgs += @('--autocompact', [string]$c.autocompact) }
 
 Set-Location -LiteralPath $c.workdir
 & $claude @cliArgs

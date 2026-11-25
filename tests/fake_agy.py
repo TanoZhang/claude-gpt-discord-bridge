@@ -53,6 +53,8 @@ if behaviour == "hang":
 elif behaviour == "quota":
     result("ERROR", error="RESOURCE_EXHAUSTED: quota exceeded for this model")
     sys.exit(1)
+elif behaviour == "newsession" and len(calls) == 1:
+    result("SUCCESS", "done, see notes [[new-session]]", conversation=conv)
 elif behaviour == "switch":
     result("SUCCESS", "sure [[effort:xhigh]] [[model:gemini-4-hydrogen-low]]", conversation=conv)
 else:

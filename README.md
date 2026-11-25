@@ -142,6 +142,8 @@ Stop or restart: `scripts\stop.ps1 [-Restart]`. A restarted Claude session start
 | `permissions_in_channel` | `true` | Claude's Allow/Deny buttons in the channel instead of DMs (takes effect when Claude restarts) |
 | `max_file_mb` | server limit | Cap for files posted to Discord |
 | `claude_watch.ctx_limit` | 150000 | Claude context (tokens) at which the bridge asks for a fresh session |
+| `claude.autocompact` | unset | Compact Claude's context at this many tokens (at least 100000) instead of switching sessions; set `ctx_limit` above it |
+| `claude.effort` | unset | Claude's default effort (`low` … `max`) |
 | `browser_idle_close_s` | 180 | Close the headless browser after this many idle seconds; the next request or web check reopens it (0 = keep it open) |
 | `archive_dir` | `""` | Folder for a local Markdown copy of the channels (`<channel>/<date>.md`, attachments in `files/`); empty = no archive |
 | `claude_watch.ensure_script` | `""` | PowerShell script that starts Claude; when set, an @Claude while no session runs starts one (Windows) |
