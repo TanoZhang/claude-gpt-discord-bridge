@@ -16,6 +16,7 @@
 param([string]$Profile, [string]$Resume)
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot '_profile.ps1') -Profile $Profile
+if (-not $cfg) { exit 1 }
 $c = $cfg.claude
 
 New-Item -ItemType Directory -Force (Join-Path $runtime 'logs') | Out-Null

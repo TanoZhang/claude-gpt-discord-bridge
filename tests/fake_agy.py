@@ -6,6 +6,7 @@ Records every call (arguments and stdin) in <state dir>/calls.json and prints st
 events like agy. A call with `--mode plan` is the bridge rating a request; the scenario's
 first word is the rating ("hard_ok" rates hard, "junk_..." rates nonsense).
 "reject" refuses a model slug with "bogus" in it, "rejectall" every run.
+The usage in a result is the conversation's running total, as agy reports it.
 Like agy 1.5.17, `--conversation` with an unknown id ("lost") warns on stderr and starts a new
 conversation instead of failing.
 """
@@ -27,6 +28,14 @@ def emit(event, **payload):
 
 
 def result(status, response="", error=None, conversation="conv-1", tokens=100):
+    # Like agy, the usage is the conversation's total so far, not this run's.
+    if conversation and conversation != "conv-router":
+        totals_file = state / "usage.json"
+        totals = json.loads(totals_file.read_text()) if totals_file.exists() else {}
+        resumed = "--conversation" in args and args[args.index("--conversation") + 1] == conversation
+        tokens += totals.get(conversation, 0) if resumed else 0
+        totals[conversation] = tokens
+        totals_file.write_text(json.dumps(totals))
     r = {"conversation_id": conversation, "status": status, "response": response, "duration_seconds": 1,
          "num_turns": 1, "usage": {"input_tokens": tokens - 10, "output_tokens": 10, "total_tokens": tokens}}
     if error:
@@ -61,6 +70,10 @@ if behaviour == "hang":
     time.sleep(120)
 elif behaviour == "quota":
     result("ERROR", error="RESOURCE_EXHAUSTED: quota exceeded for this model")
+    sys.exit(1)
+elif behaviour == "quotareset":  # agy's wording when it says when the quota is back
+    result("ERROR", error="Individual quota reached. Please upgrade your subscription to increase your limits. "
+                          "Resets in 36m2s.")
     sys.exit(1)
 elif behaviour == "newsession" and len(calls) == 1:
     result("SUCCESS", "done, see notes [[new-session]]", conversation=conv)

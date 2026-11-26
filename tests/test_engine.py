@@ -732,6 +732,15 @@ async def test_switching(tmp: Path) -> None:
     check("switch: a premium effort needs the owner", not agent.current_effort(), agent.current_effort())
     check("switch: the refusal is said", "owner" in (agent.bridge.channel.sent or [""])[-1], str(agent.bridge.channel.sent))
     agent.s["model"] = None
+    # the same premium effort in a turn the owner asked for is taken
+    agent.remember("User", "@Gemini switch to xhigh")
+    agent.s.update(request="@Gemini switch to xhigh", by_owner=True)
+    agent.pending = True
+    agent.trigger.set()
+    await run_one_turn(agent)
+    check("switch: the owner's turn may pick a premium effort", agent.current_effort() == "xhigh", agent.current_effort())
+    agent.s.pop("effort", None)
+    agent.s["model"] = None
 
     # 3. owner commands, a bad effort, back to default
     note = await agent.command("effort turbo")
@@ -779,7 +788,7 @@ async def test_progress_board(tmp: Path) -> None:
 async def test_new_session(tmp: Path) -> None:
     d = tmp / "ns"; d.mkdir()
     agent = make_gemini(d, "easy_newsession", model="m")
-    agent.s.update(thread="conv-1", turns=3)  # a session from before the rules
+    agent.s.update(thread="conv-1", turns=8, help_version=1)  # a long session from before the rules
     calls = await gemini_turn(agent)
     check("session: an old session gets the rules once", "[[new-session]]" in calls[-1]["stdin"], calls[-1]["stdin"][:200])
     check("session: the marker is not posted", "[[" not in agent.bridge.channel.sent[0], str(agent.bridge.channel.sent))
@@ -790,6 +799,29 @@ async def test_new_session(tmp: Path) -> None:
     calls = await gemini_turn(agent, "@Gemini and again")
     check("session: the rules are not repeated in a resumed turn", "[[new-session]]" not in calls[-1]["stdin"]
           and "--conversation" in calls[-1]["args"], str(calls[-1]["args"]))
+
+    # a young session's request is ignored: a fresh one would send the whole intro again
+    d = tmp / "ns-young"; d.mkdir()
+    agent = make_gemini(d, "easy_newsession", model="m")
+    agent.s.update(thread="conv-1", turns=1)
+    calls = await gemini_turn(agent)
+    check("session: the rules name the minimum", "6" in calls[-1]["stdin"].split("[[new-session]]", 1)[-1][:400],
+          calls[-1]["stdin"][-600:])
+    check("session: a young session's request is not acknowledged", not any("fresh session" in m for m in agent.bridge.channel.sent)
+          and "[[" not in agent.bridge.channel.sent[0], str(agent.bridge.channel.sent))
+    calls = await gemini_turn(agent, "@Gemini next")
+    check("session: a young session is resumed", arg(calls[-1], "--conversation") == "conv-1", str(calls[-1]["args"]))
+
+    # agy's usage is the conversation's total: a turn counts only the growth
+    agent.s.pop("usage_seen", None)
+    u = agent.turn_usage({"total_tokens": 500, "input_tokens": 450}, "c-a")
+    check("usage: the first run of a conversation counts in full", u.get("total_tokens") == 500, str(u))
+    u = agent.turn_usage({"total_tokens": 700, "input_tokens": 600}, "c-a")
+    check("usage: a resumed run counts the growth", u == {"total_tokens": 200, "input_tokens": 150}, str(u))
+    u = agent.turn_usage({"total_tokens": 700, "input_tokens": 600}, "c-a")
+    check("usage: a failed run with the same total counts nothing", u.get("total_tokens") == 0, str(u))
+    u = agent.turn_usage({"total_tokens": 90}, "c-b")
+    check("usage: a new conversation starts again", u.get("total_tokens") == 90, str(u))
 
 
 async def test_self_heal(tmp: Path) -> None:
@@ -993,6 +1025,120 @@ async def test_progress_wake(tmp: Path) -> None:
     await b2.close()
 
 
+def set_scenario(agent, scenario: str) -> None:
+    """Point a fake agy at another scenario, keeping the agent and its state."""
+    fake = Path(agent.cfg["executable"])
+    fake.write_text(f'@echo off\r\n"{sys.executable}" "{ROOT / "tests" / "fake_agy.py"}" "{fake.parent}" {scenario} %*\r\n',
+                    encoding="ascii")
+
+
+def agy_calls(agent) -> list:
+    f = Path(agent.workdir) / "calls.json"
+    return json.loads(f.read_text()) if f.exists() else []
+
+
+async def test_usage_limit(tmp: Path) -> None:
+    import datetime as dt
+    # 1. when the limit ends, as agy and Codex say it
+    now = 1_000_000.0
+    check("limit: agy's 'Resets in 36m2s'", cli.limit_ends("quota reached. Resets in 36m2s.", now) == now + 36 * 60 + 2,
+          str(cli.limit_ends("quota reached. Resets in 36m2s.", now)))
+    check("limit: 'try again in 2 hours 5 minutes'", cli.limit_ends("try again in 2 hours 5 minutes", now) == now + 7500)
+    codex_text = ("You've hit your usage limit. Visit https://chatgpt.com/settings/usage to purchase more credits "
+                  "or try again at Nov 28th, 2026 7:46 PM.")
+    check("limit: Codex's 'try again at Nov 28th, 2026 7:46 PM'",
+          cli.limit_ends(codex_text) == dt.datetime(2026, 11, 28, 19, 46).timestamp(), str(cli.limit_ends(codex_text)))
+    check("limit: no end named, nothing remembered", cli.limit_ends("RESOURCE_EXHAUSTED: quota exceeded") is None)
+
+    # 2. a limit with its end: no more runs before then, an immediate notice that mentions the requester
+    d = tmp / "gem"; d.mkdir()
+    agent = make_gemini(d, "easy_quotareset", model="m", retries=0)
+    await agent.observe(FakeMsg(951, author_id=20, bot=True, content="@Gemini do it"), "Claude", "@Gemini do it", may_trigger=True)
+    await run_one_turn(agent)
+    until = float(agent.s.get("limited_until") or 0)
+    check("limit: the end is remembered", abs(until - (time.time() + 36 * 60 + 2)) < 120, str(until))
+    runs = len(agy_calls(agent))
+    await agent.observe(FakeMsg(952, author_id=20, bot=True, content="@Gemini again"), "Claude", "@Gemini again", may_trigger=True)
+    await run_one_turn(agent)
+    sent = agent.bridge.channel.sent
+    check("limit: a request while limited runs no CLI (no rating either)", len(agy_calls(agent)) == runs,
+          f"{runs} -> {len(agy_calls(agent))}")
+    check("limit: the notice says until when and mentions the requester", sent and "<@20>" in sent[-1]
+          and "until" in sent[-1] and "did not finish" not in sent[-1], str(sent[-1:]))
+    kept = "\n".join(t for _, t, _ in agent.s["buffer"])
+    check("limit: the messages are kept for later", "do it" in kept and "again" in kept, str(agent.s["buffer"]))
+    check("limit: status shows it", "until" in await agent.command("status"))
+    # the owner's own request still tries
+    await agent.observe(FakeMsg(953, author_id=10, content="@Gemini try now"), "User", "@Gemini try now", may_trigger=True)
+    set_scenario(agent, "easy_ok")
+    await run_one_turn(agent)
+    check("limit: an owner's request runs anyway", len(agy_calls(agent)) == runs + 1, str(len(agy_calls(agent))))
+    check("limit: a good turn forgets the limit", "limited_until" not in agent.s, str(agent.s.get("limited_until")))
+    agent.s["limited_until"] = time.time() + 600
+    note = await agent.command("unlimit")
+    check("limit: !gemini unlimit forgets it", "limited_until" not in agent.s and "Gemini" in note, note)
+
+    # 3. the help a session from before the rules gets counts as delivered only once a turn succeeds
+    d = tmp / "help"; d.mkdir()
+    agent = make_gemini(d, "easy_quota", model="m", retries=0)
+    agent.s.update(thread="conv-1", turns=8, help_version=1)
+    await gemini_turn(agent)
+    check("help: a failed turn does not use up the help", agent.s.get("help_version") == 1, str(agent.s.get("help_version")))
+    set_scenario(agent, "easy_ok")
+    calls = await gemini_turn(agent, "@Gemini again")
+    check("help: the next turn sends it again", "[[new-session]]" in calls[-1]["stdin"], calls[-1]["stdin"][:200])
+    check("help: delivered after a good turn", agent.s.get("help_version") == cli.HELP_VERSION, str(agent.s.get("help_version")))
+
+
+async def test_turn_requesters(tmp: Path) -> None:
+    # A request that arrives during a turn belongs to the next turn: it does not change who is
+    # mentioned when the running turn fails, nor whether the running turn counts as the owner's.
+    d = tmp / "gem"; d.mkdir()
+    agent = make_gemini(d, "easy_hang", model="m", retries=0, stall_timeout_s=3)
+    task = asyncio.create_task(agent.worker())
+    await agent.observe(FakeMsg(961, author_id=20, bot=True, content="@Gemini do it"), "Claude", "@Gemini do it", may_trigger=True)
+    end = time.time() + 20
+    while not agent.busy and time.time() < end:
+        await asyncio.sleep(0.1)
+    await agent.observe(FakeMsg(962, author_id=10, content="@Gemini and this"), "User", "@Gemini and this", may_trigger=True)
+    check("requesters: the running turn is not the owner's", agent.busy and not agent.turn_by_owner
+          and agent.s.get("by_owner") is True, f"{agent.busy} {agent.turn_by_owner} {agent.s.get('by_owner')}")
+    sent = agent.bridge.channel.sent
+    while len(sent) < 2 and time.time() < end + 20:
+        await asyncio.sleep(0.2)
+    task.cancel()
+    await agent.kill()
+    check("requesters: the failed turn mentions only who asked for it", sent and "<@20>" in sent[0] and "<@10>" not in sent[0],
+          str(sent[:1]))
+    check("requesters: the next turn mentions the later requester", len(sent) > 1 and "<@10>" in sent[1]
+          and "<@20>" not in sent[1], str(sent[1:2]))
+
+
+def test_profile_lookup(tmp: Path) -> None:
+    saved = gb.ROOT
+    try:
+        gb.ROOT = tmp
+        (tmp / "profiles").mkdir()
+        prof = tmp / "profiles" / "alpha.json"
+        prof.write_text('{"channel_id": "1"}', encoding="utf-8")
+        (tmp / "profiles" / "strings.zh.json").write_text('{"x": "y"}', encoding="utf-8")
+        check("profile: a bare name is profiles/<name>.json", gb.find_profile("alpha") == prof.resolve())
+        check("profile: the name with .json too", gb.find_profile("alpha.json") == prof.resolve())
+        check("profile: a full path as given", gb.find_profile(str(prof)) == prof.resolve())
+        try:
+            gb.find_profile("nope")
+            check("profile: an unknown name stops with a message", False)
+        except SystemExit as e:
+            msg = str(e)
+            check("profile: an unknown name lists the profiles", "nope" in msg and "alpha" in msg and "strings" not in msg, msg)
+    finally:
+        gb.ROOT = saved
+
+
+async def test_profile_lookup_async(tmp: Path) -> None:
+    test_profile_lookup(tmp)
+
+
 async def main() -> None:
     logging.basicConfig(level=logging.CRITICAL)
     with tempfile.TemporaryDirectory() as t:
@@ -1000,7 +1146,8 @@ async def main() -> None:
         for i, test in enumerate((test_buffer, test_halt, test_web_turns, test_mirror_rules, test_page_loads, test_reports, test_codex_buffer, test_codex_runs,
                                   test_gemini_routing, test_gemini_runs,
                                   test_switching, test_progress_board, test_new_session,
-                                  test_self_heal, test_failure_mention, test_progress_wake)):
+                                  test_self_heal, test_failure_mention, test_progress_wake,
+                                  test_usage_limit, test_turn_requesters, test_profile_lookup_async)):
             d = tmp / str(i)
             d.mkdir()
             try:

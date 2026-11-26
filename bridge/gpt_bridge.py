@@ -74,9 +74,39 @@ RUNTIME = DATA           # files shared with Claude: handoff.md, restart.request
 PROFILE: Path | None = None  # set by --profile
 
 
+def profile_names() -> list[str]:
+    """The profiles in <repository>/profiles (JSON files with a channel_id), for messages."""
+    names = []
+    for f in sorted((ROOT / "profiles").glob("*.json")):
+        try:
+            if '"channel_id"' in f.read_text(encoding="utf-8-sig"):
+                names.append(f.stem)
+        except OSError:
+            pass
+    return names
+
+
+def find_profile(arg: str) -> Path:
+    """A profile as given: a path (relative to the current folder or to the repository), or a
+    bare name: `magi` is profiles/magi.json, or the folder profiles/magi. Same rules as
+    scripts/_profile.ps1."""
+    given = Path(os.path.expanduser(arg))
+    candidates = [given] + ([ROOT / given] if not given.is_absolute() else [])
+    if not re.search(r"[\\/]", arg) and not arg.startswith("~"):
+        stem = arg[:-5] if arg.lower().endswith(".json") else arg
+        candidates += [ROOT / "profiles" / f"{stem}.json", ROOT / "profiles" / stem]
+    for c in candidates:
+        if c.exists():
+            return c.resolve()
+    known = profile_names()
+    raise SystemExit(f"profile not found: {arg} (a JSON file, a folder with config.json, or a name in "
+                     f"{ROOT / 'profiles'})" + (f"; profiles there: {', '.join(known)}" if known else ""))
+
+
 def use_profile(arg: str) -> None:
     """Run from a profile instead of the repository root, so one copy of the code serves
-    several projects. `arg` is a JSON file (the config itself) or a folder holding config.json.
+    several projects. `arg` is a JSON file (the config itself) or a folder holding config.json,
+    as a path or a bare name from profiles/ (see find_profile).
 
     Keys read here (all optional):
       runtime_dir     files shared with Claude and the launcher: handoff.md, restart.request,
@@ -89,7 +119,7 @@ def use_profile(arg: str) -> None:
     """
     global PROFILE, CONFIG_FILE, RUNTIME, DATA, TOKEN_FILE, STATE_FILE, PROFILE_DIR, LOG_DIR
     global STOP_FLAG, LOCK_FILE, ACCESS_FILE, INBOX_DIR, OUTBOX_DIR, REPORTS_DIR, STATUS_FILE
-    p = Path(os.path.expanduser(arg)).resolve()
+    p = find_profile(arg)
     if p.is_dir():
         PROFILE, CONFIG_FILE, default_runtime = p, p / "config.json", p
     else:
@@ -187,6 +217,9 @@ DEFAULT_STRINGS = {
     "agent_loop_cap": "(AI messages in a row: {n}. {name} is not starting; waiting for a human.)",
     "agent_failed": "({name} did not finish this time: {err}. The messages are kept; the next @{name} sends them again.)",
     "agent_limit": "{name} usage or rate limit reached: {err}",
+    "agent_limited": "({name} is at its usage limit until {when} and was not run. Give the work to someone else; a request from the owner makes {name} try anyway.)",
+    "agent_limited_line": " At its usage limit until {when} (`!{cmd} unlimit` clears it).",
+    "agent_unlimited": "{name} runs again at the next request.",
     "agent_empty": "({name} returned nothing.)",
     "agent_stalled": "{name} produced nothing for {min} min and was stopped",
     "agent_timeout": "{name} ran longer than {min} min and was stopped",
@@ -207,7 +240,7 @@ DEFAULT_STRINGS = {
     "agent_usage": " Last turn: model {model} ({tier}), {last} tokens; {total} tokens since the bridge started.",
     "agent_model_line": " Model {model}, effort {effort}.",
     "agent_default_value": "default",
-    "agent_session_help": "[New sessions] Every turn re-reads your whole session, so a long one wastes quota. When your session has grown long (many turns, big files or logs read) or a big piece of work is finished and reported, write [[new-session]] in your reply: your next turn starts a fresh session that gets the intro and your last replies. Put anything the next session must know (what is done, what is open, where things are) in that reply. Do not do it in the middle of a task.",
+    "agent_session_help": "[New sessions] Every turn re-reads your whole session, so a long one wastes quota. When your session has grown long (many turns, big files or logs read) or a big piece of work is finished and reported, write [[new-session]] in your reply: your next turn starts a fresh session that gets the intro and your last replies. Put anything the next session must know (what is done, what is open, where things are) in that reply. Do not do it in the middle of a task, nor in a session of fewer than {min_turns} turns (such a request is ignored: a fresh session costs more than a short one).",
     "agent_session_next": "({name} starts a fresh session from its next turn.)",
     "agent_model_words": "model|effort|reasoning",  # a request matching this regex gets the switch help
     "agent_switch_help": "[Your model and effort] You run on model {model}, effort {effort}. Pick the model and effort that fit the task: lighter for simple work, stronger only when the work needs it. To switch, write [[model:NAME]] and/or [[effort:LEVEL]] in your reply (NAME from {models}; LEVEL one of: {efforts}; \"default\" returns to the configured one); the bridge applies it from your next turn and says so in the channel. Only when {user} asks for it: {premium}. Do not change any config file yourself.",
@@ -2963,6 +2996,10 @@ def main() -> None:
     if a.check:
         run_check()
         return
+    if not CONFIG_FILE.is_file():
+        known = profile_names()
+        raise SystemExit(f"config not found: {CONFIG_FILE}" + (f" (pass --profile <name>; profiles: {', '.join(known)})"
+                         if known else " (copy config.example.json to config.json, or pass --profile)"))
     setup_logging(console=a.login or a.probe)
     cfg, state = load_config(), load_json(STATE_FILE, {})
 

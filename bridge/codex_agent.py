@@ -14,17 +14,20 @@ config.json:
     "network": true,                  network access inside workspace-write
     "context_max_chars": 20000,
     "rotate_turns": 40,               start a new Codex thread after this many turns
+    "min_session_turns": 6,           a [[new-session]] request in a younger session is ignored
     "stall_timeout_s": 1800,          stop a run that produced no event for this long (0 = never)
     "turn_timeout_s": 10800,          stop a run that takes longer than this in total (0 = never)
     "retries": 1,                     automatic retries of a failed run (not for usage limits)
     "model": "",                      optional; default is the model in ~/.codex/config.toml
+    "effort": "",                     optional model_reasoning_effort (e.g. low, medium, high, xhigh)
+    "premium": [],                    models or effort levels the member may switch to only in a turn the owner asked for
     "disable_features": [],           Codex feature flags to turn off for these runs (`codex features list`),
                                       e.g. ["apps", "plugins", "computer_use", "browser_use", "image_generation",
                                       "multi_agent", "goals", "realtime_conversation"]: a smaller fixed context
     "config_overrides": [],           extra `-c key=value` settings
     "intro": "..."                    optional; sent at the start of each Codex thread
   }
-Owner commands: !codex status | !codex stop | !codex new
+Owner commands: !codex status | !codex stop | !codex new | !codex model|effort <value> | !codex unlimit
 """
 from __future__ import annotations
 

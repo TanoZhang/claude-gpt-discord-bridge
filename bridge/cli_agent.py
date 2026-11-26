@@ -31,7 +31,43 @@ NO_WINDOW = 0x08000000 if os.name == "nt" else 0
 # In a reply: [[model:NAME]] / [[effort:LEVEL]] switches the member from its next turn ("default" = the config's).
 SWITCH_RE = re.compile(r"\[\[(model|effort):\s*([^\]\s]+)\s*\]\]", re.I)
 NEW_SESSION_RE = re.compile(r"\[\[new-session\]\]", re.I)  # in a reply: a fresh session from the next turn
-HELP_VERSION = 1  # raise when switch_help / session_help change: running sessions get them once more
+HELP_VERSION = 2  # raise when switch_help / session_help change: running sessions get them once more
+# When a usage limit ends, as the CLIs say it: agy `Resets in 36m2s`, Codex `try again at Nov 28th, 2026 7:46 PM`.
+RESET_IN_RE = re.compile(r"(?:resets?|try again|retry)\s+in\s+((?:\d+\s*[a-z]*[\s,]*)+)", re.I)
+RESET_AT_RE = re.compile(r"(?:resets?|try again)\s+(?:at|on)\s+([A-Za-z]{3,9})\.?\s+(\d{1,2})(?:st|nd|rd|th)?,?\s+"
+                         r"(\d{4}),?\s+(?:at\s+)?(\d{1,2}):(\d{2})\s*([AaPp][Mm])?", re.I)
+UNIT_RE = re.compile(r"(\d+)\s*(hours?|hrs?|h|minutes?|mins?|m|seconds?|secs?|s)?", re.I)
+
+
+def limit_ends(text: str, now: float | None = None) -> float | None:
+    """When a usage limit ends (unix time), from the CLI's message; None when it does not say."""
+    import datetime as dt
+
+    now = time.time() if now is None else now
+    m = RESET_IN_RE.search(text or "")
+    if m:
+        secs = 0
+        for n, unit in UNIT_RE.findall(m.group(1)):
+            u = (unit or "s").lower()
+            secs += int(n) * (3600 if u.startswith("h") else 60 if u.startswith("m") else 1)
+        return now + secs if secs else None
+    m = RESET_AT_RE.search(text or "")
+    if m:
+        month, day, year, hour, minute, ampm = m.groups()
+        try:
+            mon = dt.datetime.strptime(month[:3].title(), "%b").month
+        except ValueError:
+            return None
+        hour = int(hour) % 12 + (12 if (ampm or "").lower() == "pm" else 0) if ampm else int(hour)
+        try:
+            return dt.datetime(int(year), mon, int(day), hour, int(minute)).timestamp()
+        except ValueError:
+            return None
+    return None
+
+
+class Limited(RuntimeError):
+    """The member is at its usage limit: the turn is not run, the notice says until when."""
 
 
 def read_token(path: Path, var: str) -> str:
@@ -81,6 +117,11 @@ class CliAgent:
         self.poster = None  # a REST-only client logged in as the member's bot
         self.attachments: list = []  # Discord attachments since the last turn (not persisted)
         self.bare = False  # this turn runs without --model / --effort: the CLI refused the configured ones
+        # who asked for the running turn: taken from the state when it starts, so a request that
+        # arrives meanwhile (it waits for the next turn) does not change them
+        self.turn_requesters: list[int] = []
+        self.turn_by_owner = False
+        self.help_sent = False  # this turn's prompt carries the switch and session help
         s = self.state.setdefault(self.key, {})
         s.setdefault("buffer", [])
 
@@ -265,8 +306,10 @@ class CliAgent:
             who = self.requester_of(msg)
             requesters = [i for i in self.s.get("requesters", []) if i != who] + [who]
             # by_owner: only a turn the owner asked for may switch the member's model or effort
+            # (owner or not: any of the requests waiting for the next turn)
+            by_owner = bool(self.s.get("by_owner")) or msg.author.id == getattr(self.bridge, "owner_id", None)
             self.s.update(pending=True, target=self.target_id, request=text[-2000:], requesters=requesters[-3:],
-                          by_owner=msg.author.id == getattr(self.bridge, "owner_id", None))  # survives a bridge restart
+                          by_owner=by_owner)  # survives a bridge restart
             self.trigger.set()
         self.save()
 
@@ -305,6 +348,9 @@ class CliAgent:
             atts, self.attachments = self.attachments[-10:], []
             if not self.closing:
                 self.stopped = False
+            # This turn's requesters; requests that arrive during it collect anew for the next one.
+            self.turn_requesters = list(self.s.pop("requesters", None) or [])
+            self.turn_by_owner = bool(self.s.pop("by_owner", False))
             self.busy = True
             try:
                 await self.run_turn(context, atts, target)
@@ -313,16 +359,19 @@ class CliAgent:
                 self.attachments = atts + self.attachments  # they go out again with the next request
                 if self.closing:  # the bridge is stopping mid-turn: the request stays pending for the next start
                     self.log.info("%s: turn interrupted by the bridge stopping; it runs again after the restart", self.key)
-                    self.s.update(pending=True, target=target)
+                    later = [i for i in self.s.get("requesters", []) if i not in self.turn_requesters]
+                    self.s.update(pending=True, target=target, requesters=(self.turn_requesters + later)[-3:],
+                                  by_owner=self.turn_by_owner or bool(self.s.get("by_owner")))
                     self.taken = 0
                     self.save()
                     return
                 if self.stopped:  # `!name stop`: the owner already got the answer to that command
                     self.log.info("%s: turn stopped by the owner", self.key)
                 else:
-                    self.log.exception("%s turn failed", self.key)
+                    if not isinstance(e, Limited):
+                        self.log.exception("%s turn failed", self.key)
                     try:
-                        await self.post(target, self.failure_text(str(e)), plain=True)
+                        await self.post(target, self.failure_text(str(e), wrap=not isinstance(e, Limited)), plain=True)
                     except Exception:  # Discord trouble must not end this worker: nobody would run the member again
                         self.log.exception("%s: could not post the failure notice", self.key)
             finally:
@@ -334,12 +383,27 @@ class CliAgent:
                         self.s.pop(k, None)
                 self.save()
 
-    def failure_text(self, err: str) -> str:
+    def failure_text(self, err: str, wrap: bool = True) -> str:
         """The failure notice, mentioning whoever asked for the turn (the owner, Claude, GPT or a
         member): a bot that asked is woken by it and can give the work to someone else. A bot that
         is mentioned starts a turn only under the bridge's AI-streak cap, as for any bot message."""
-        who = " ".join(f"<@{i}>" for i in self.s.get("requesters", []) if i and i != self.bot_id)
-        return (who + " " if who else "") + self.t("failed", err=err[:300])
+        who = " ".join(f"<@{i}>" for i in self.turn_requesters if i and i != self.bot_id)
+        return (who + " " if who else "") + (self.t("failed", err=err[:300]) if wrap else err)
+
+    # -- usage limit: while the CLI said it is limited, a turn is not run (it would only fail again)
+    def limited_until(self) -> float:
+        until = float(self.s.get("limited_until") or 0)
+        return until if until > time.time() else 0.0
+
+    def when(self, at: float) -> str:
+        return time.strftime("%H:%M" if at - time.time() < 20 * 3600 else "%m-%d %H:%M", time.localtime(at))
+
+    def note_limit(self, err: str) -> None:
+        at = limit_ends(err)
+        if at and at > time.time():
+            self.s["limited_until"] = at
+            self.log.warning("%s: usage limit until %s; turns are not run before then unless the owner asks",
+                             self.key, time.strftime("%Y-%m-%d %H:%M", time.localtime(at)))
 
     def build_prompt(self, context: str, files: list[Path], target: int, fresh: bool) -> str:
         S = self.S
@@ -349,15 +413,15 @@ class CliAgent:
             parts.append(intro.format(workdir=self.workdir, outbox=self.outbox,
                                       user=S("user_label"), claude=S("claude_label")))
             parts.append(self.switch_help())
-            parts.append(self.t("session_help"))
-            self.s["help_version"] = HELP_VERSION
+            parts.append(self.t("session_help", min_turns=self.min_session_turns()))
+            self.help_sent = True
             recent = self.s.get("recent", [])
             if recent:
                 parts.append(self.t("recent_header") + "\n" + "\n---\n".join(recent))
         elif self.s.get("help_version") != HELP_VERSION:  # a session that started before these rules
             parts.append(self.switch_help())
-            parts.append(self.t("session_help"))
-            self.s["help_version"] = HELP_VERSION
+            parts.append(self.t("session_help", min_turns=self.min_session_turns()))
+            self.help_sent = True  # counted as delivered once the turn succeeds
         elif re.search(self.t("model_words"), self.s.get("request") or "", re.I):
             parts.append(self.switch_help())
         parts.append(self.t("context_header") + "\n" + context)
@@ -439,6 +503,11 @@ class CliAgent:
             pass
 
     async def run_turn(self, context: str, atts: list, target: int) -> None:
+        until = self.limited_until()
+        if until and not self.turn_by_owner:  # the owner's own request tries anyway (maybe more quota now)
+            self.log.info("%s: at its usage limit until %s; not run", self.key, self.when(until))
+            raise Limited(self.t("limited", when=self.when(until)))
+        self.help_sent = False
         files, failed = await self.bridge.download(atts) if atts else ([], [])
         if failed:
             context += "\n\n" + self.S("attach_failed", names=", ".join(failed))
@@ -494,19 +563,34 @@ class CliAgent:
                     prompt = self.t("continue", err=error[:200])
         if error and not (messages and self.completed):
             if LIMIT_RE.search(error):
+                self.note_limit(error)
                 raise RuntimeError(self.t("limit", err=error[:200]))
             raise RuntimeError(error[:300])
+        self.s.pop("limited_until", None)
+        if self.help_sent:
+            self.s["help_version"] = HELP_VERSION
         self.s["turns"] = int(self.s.get("turns", 0)) + 1
         reply = messages[-1] if messages else self.t("empty")
         reply, notes = self.apply_switches(reply)
         if NEW_SESSION_RE.search(reply):  # the member asks for a fresh session from its next turn
             reply = NEW_SESSION_RE.sub("", reply).strip()
-            self.s["fresh_next"] = True
-            notes.append(self.t("session_next"))
-            self.log.info("%s: asked for a new session from its next turn", self.key)
+            turns = int(self.s.get("turns", 0))
+            if turns < self.min_session_turns():
+                # A fresh session sends the whole intro again: after a turn or two that costs more
+                # than resuming, so a young session is kept.
+                self.log.info("%s: asked for a new session after %d turns; kept (min_session_turns %d)",
+                              self.key, turns, self.min_session_turns())
+            else:
+                self.s["fresh_next"] = True
+                notes.append(self.t("session_next"))
+                self.log.info("%s: asked for a new session from its next turn", self.key)
         self.s["recent"] = (self.s.get("recent", []) + [reply[:1200]])[-3:]
         self.save()
         await self.post(target, reply + "".join("\n\n" + n for n in notes))
+
+    def min_session_turns(self) -> int:
+        """A [[new-session]] in a session with fewer turns than this is ignored."""
+        return max(0, int(self.cfg.get("min_session_turns", 6)))
 
     def premium(self) -> set[str]:
         """Models and effort levels (config `premium`) only the owner may ask for."""
@@ -521,7 +605,7 @@ class CliAgent:
         reply = SWITCH_RE.sub("", reply).strip()
         notes = []
         for what, value in found:
-            if value.lower() in self.premium() and not self.s.get("by_owner"):
+            if value.lower() in self.premium() and not self.turn_by_owner:
                 self.log.warning("%s: ignored a switch to premium %s %s outside an owner's turn", self.key, what, value)
                 notes.append(self.t("switch_refused", value=value))
             else:
@@ -597,8 +681,10 @@ class CliAgent:
 
     # -- owner commands
     def status_extra(self) -> str:
+        until = self.limited_until()
         return self.t("model_line", model=self.current_model() or self.t("default_value"),
-                      effort=self.current_effort() or self.t("default_value"))
+                      effort=self.current_effort() or self.t("default_value")) + (
+            self.t("limited_line", when=self.when(until), cmd=self.key) if until else "")
 
     async def command(self, arg: str) -> str:
         words = arg.split()
@@ -607,6 +693,10 @@ class CliAgent:
             if len(words) < 2:
                 return self.status_extra().strip()
             return self.switch(cmd, words[1])
+        if cmd == "unlimit":  # the owner knows the quota is back
+            self.s.pop("limited_until", None)
+            self.save()
+            return self.t("unlimited")
         if cmd == "stop":
             if self.busy:
                 self.stopped = True  # also ends a pending retry

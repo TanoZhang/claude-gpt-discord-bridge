@@ -16,7 +16,8 @@
     "prompt_template": "prompts/claude-prompt.md"
   },
 
-  "claude_watch": { "ctx_limit": 150000, "ensure_script": "", "wake_on_mention": false, "idle_stop_min": 0 },
+  "claude_watch": { "ctx_limit": 150000, "ensure_script": "", "wake_on_mention": false, "idle_stop_min": 0,
+                   "progress_check_min": 0, "progress_heading": "In progress" },
   "permissions_in_channel": true,
   "max_file_mb": null,
 
@@ -50,6 +51,9 @@
     "turn_timeout_s": 10800,
     "retries": 1,
     "model": "",
+    "effort": "",
+    "premium": [],
+    "min_session_turns": 6,
     "disable_features": []
   },
 
@@ -65,8 +69,10 @@
     "router_model": "",
     "router_fallback": "medium",
     "effort": "",
+    "premium": [],
     "context_max_chars": 20000,
     "rotate_turns": 40,
+    "min_session_turns": 6,
     "stall_timeout_s": 1800,
     "turn_timeout_s": 10800,
     "retries": 1

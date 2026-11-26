@@ -88,18 +88,22 @@ The official plugin (`discord@claude-plugins-official`) ignores every message fr
 
 ## Setup (Windows, tested)
 
-**You need:** Claude Code CLI with the Discord channel plugin installed and configured (`/discord:configure`; the plugin also needs [Bun](https://bun.sh)), Python 3.10+, Google Chrome, and a Discord server where you and your Claude bot already are.
+**You need:** Git, Claude Code CLI with the Discord channel plugin installed and configured (`/discord:configure`; the plugin also needs [Bun](https://bun.sh)), Python 3.10+, Google Chrome, and a Discord server where you and your Claude bot already are. Codex and Gemini are optional members with their own CLI and bot (see [Codex](#codex-optional) and [Gemini](#gemini-optional)).
+
+Windows does not run downloaded scripts under its default execution policy: start every script as `powershell -ExecutionPolicy Bypass -File scripts\<name>.ps1 …` (as below); no policy change is needed.
 
 1. **Create the GPT bot.** [Discord Developer Portal](https://discord.com/developers/applications) → New Application "GPT" → Bot → turn on **Message Content Intent** → Reset Token. Invite it with View Channels, Send Messages, Read Message History and Attach Files:
    `https://discord.com/oauth2/authorize?client_id=<GPT_APP_ID>&scope=bot&permissions=101376`
 2. **Install.**
-   ```bash
+   ```powershell
    git clone https://github.com/TanoZhang/claude-gpt-discord-bridge
    cd claude-gpt-discord-bridge
    python -m venv .venv
    .venv\Scripts\pip install -r requirements.txt
+   .venv\Scripts\python tests\test_engine.py
    ```
-3. **Configure.** Copy `config.example.json` to `config.json` and fill in the channel, your user ID, both bot IDs (Discord → Developer Mode → right-click → Copy ID), your ChatGPT conversation URL and its project URL, and `claude.workdir`. Put the GPT token in `gpt-bot.env` as `GPT_BOT_TOKEN=…`. Both files are gitignored.
+   The bridge drives your installed Google Chrome (`browser_channel: "chrome"`), so no Playwright browser download is needed. The offline tests need no accounts and should all pass. `scripts\ensure.ps1` starts the bridge with `.venv\Scripts\pythonw.exe` (or the config's `python`).
+3. **Configure.** Copy `config.example.json` to `config.json` (one project), or to a profile such as `profiles\<name>.json` (several projects, see [below](#several-projects-from-one-copy); `profiles/` is gitignored, so a fresh clone has none) and fill in the channel, your user ID, both bot IDs (Discord → Developer Mode → right-click → Copy ID), your ChatGPT conversation URL and its project URL, and `claude.workdir`. Put the GPT token in `gpt-bot.env` as `GPT_BOT_TOKEN=…`. Both files are gitignored.
 4. **Open the channel to both bots.** In `~/.claude/channels/discord/access.json`:
    ```json
    "groups": { "<channel id>": { "requireMention": true, "allowFrom": ["<your user id>", "<GPT bot id>"] } },
@@ -124,6 +128,7 @@ The official plugin (`discord@claude-plugins-official`) ignores every message fr
 | `!gpt show` / `!gpt hide` | Show the browser to log in or pass a check, then hide it |
 | `@Codex …` / `!codex status\|stop\|new` | Ask Codex / its state, stop its current turn, start a new Codex session (only with `codex` enabled) |
 | `@Gemini …` / `!gemini status\|stop\|new` | The same for Gemini (only with `gemini` enabled) |
+| `!codex unlimit` (and `!gemini …`) | Forget a usage limit the CLI reported, so the next request runs again |
 | `!codex model <name>` / `!codex effort <level>` (and `!gemini …`) | Switch that member's model or effort from its next turn; `default` returns to the config |
 | `!halt` / `!resume` | Pause the group (GPT quiet, Claude stops after its current step) / continue |
 
@@ -155,15 +160,17 @@ Stop or restart: `scripts\stop.ps1 [-Restart]`. A restarted Claude session start
 
 ## Codex (optional)
 
-The bridge can add the Codex CLI as a third member. It needs the Codex CLI installed and signed in, and a second Discord bot for Codex (invite it to the channel with read and send permissions).
+The bridge can add the Codex CLI as a third member. It needs the Codex CLI installed and signed in (`npm install -g @openai/codex`, then `codex login`; the CLI bundled with the Codex desktop app is found too), and a second Discord bot for Codex (invite it to the channel with read and send permissions).
 
 1. Put its token in `codex-bot.env` in the repository root (`CODEX_DISCORD_BOT_TOKEN=...`), or point `codex.token_file` at another file.
 2. In `config.json` set `codex.enabled` to `true`, `codex.workdir` to the project folder Codex works in, and `codex.bot_id` to the Codex bot's user id. To let Claude hear the Codex bot, add its id to `allowFrom` in the Discord plugin's `access.json` (the bridge itself ignores that entry as a human).
 3. Restart the bridge.
 
-Codex is a group member like GPT: it receives every channel message since its own last reply (up to `codex.context_max_chars`), each with the speaker in front, but it only runs when someone writes `@Codex` (the owner, Claude or GPT). It answers in the channel where it was asked, and mentions `@Claude` or `@GPT` only when it needs them. Files it should post go to the outbox and are referenced as `[[discord-file:PATH]]`. The Codex thread is resumed between turns and renewed after `codex.rotate_turns` turns. If the Codex bot cannot log in, its replies are posted by the GPT bot with a `[Codex]` prefix. Other options: `executable` (auto-detected when empty), `sandbox` (`workspace-write` or `danger-full-access`), `network`, and `intro` to replace the default instructions.
+Codex is a group member like GPT: it receives every channel message since its own last reply (up to `codex.context_max_chars`), each with the speaker in front, but it only runs when someone writes `@Codex` (the owner, Claude or GPT). It answers in the channel where it was asked, and mentions `@Claude` or `@GPT` only when it needs them. Files it should post go to the outbox and are referenced as `[[discord-file:PATH]]`. The Codex thread is resumed between turns and renewed after `codex.rotate_turns` turns. A member can ask for a fresh session itself (`[[new-session]]` in a reply); a session younger than `min_session_turns` (default 6) is kept, since a fresh one sends the whole intro again. If the Codex bot cannot log in, its replies are posted by the GPT bot with a `[Codex]` prefix. Other options: `executable` (auto-detected when empty), `sandbox` (`workspace-write` or `danger-full-access`), `network`, and `intro` to replace the default instructions.
 
 Owner commands: `!codex status`, `!codex stop` (kill the current turn), `!codex new` (start a fresh Codex session next time). `!halt` pauses Codex too.
+
+When a member's CLI reports a usage limit with its end (`Resets in 36m`, `try again at Nov 28th, 2026 7:46 PM`), the bridge does not run that member again before then: a request gets an immediate notice that mentions whoever asked, so they can give the work to someone else. A request from the owner still runs, in case the quota is back; `!codex unlimit` / `!gemini unlimit` forgets the limit.
 
 ## Gemini (optional)
 
@@ -177,7 +184,7 @@ It behaves like Codex: `@Gemini` (or a reply to its message) starts a turn, the 
 
 ### Switching models and effort
 
-Codex and Gemini switch their own model or effort when the owner asks them to: the member writes `[[model:NAME]]` or `[[effort:LEVEL]]` in its reply, and the bridge removes the marker, applies it from the member's next turn and says so in the channel. Only a turn the owner asked for can switch; the owner can also type the `!codex` / `!gemini` commands above. The choice is kept in the bridge state until it is changed again.
+Codex and Gemini pick the model and effort that fit the task: the member writes `[[model:NAME]]` or `[[effort:LEVEL]]` in its reply, and the bridge removes the marker, applies it from the member's next turn and says so in the channel. Models and effort levels listed in the member's `premium` (e.g. `["xhigh", "max"]`) are taken only in a turn the owner asked for; the owner can also type the `!codex` / `!gemini` commands above. The choice is kept in the bridge state until it is changed again.
 
 Claude switches by writing `<runtime_dir>/claude-model.json` (`{"model": "...", "effort": "..."}`) and the word `resume` into `restart.request`: the bridge restarts it in the same conversation, and `scripts/launch-claude.ps1` passes the new `--model` / `--effort` (`claude.effort` sets a default effort).
 
@@ -207,10 +214,10 @@ Give each project its own profile: a JSON file with the same keys as `config.jso
 ```
 
 - `runtime_dir` holds what Claude and the launcher share (handoff.md, restart.request, status.md, reports/, gpt-bot.env, logs/claude-run.log); `data_dir` (default `<runtime_dir>/bridge`) holds the bridge's own state, browser profile and logs. `gpt_token_file` and `strings_file` (wording shared by several profiles) are optional.
-- Every command takes the profile: `python bridge/gpt_bridge.py --profile a.json [--login|--probe|--check]`, `scripts\ensure.ps1 -Profile a.json [-BridgeOnly]`, `scripts\stop.ps1 -Profile a.json [-Restart] [-KeepClaude]`. `--check` prints the resolved paths and starts nothing.
+- Every command takes the profile: `python bridge/gpt_bridge.py --profile a.json [--login|--probe|--check]`, `scripts\ensure.ps1 -Profile a.json [-BridgeOnly]`, `scripts\stop.ps1 -Profile a.json [-Restart] [-KeepClaude]`. `--check` prints the resolved paths and starts nothing. The profile is a path, or the bare name of a file in `profiles/`: `-Profile a` and `--profile a` mean `profiles\a.json` (or the folder `profiles\a`).
 - `claude_watch.wake_on_mention: true` starts the Claude session when someone @mentions it (start the bridge alone with `-BridgeOnly`); `claude_watch.idle_stop_min` stops an idle Claude session and resumes the same conversation at the next mention.
-- `scripts/status.ps1 [-Profile a.json]` shows what is running and the end of the bridge log.
+- `scripts/status.ps1 [-Profile a]` shows what is running and the end of the bridge log.
 - `codex.disable_features` turns Codex feature flags off for the bridge's runs (see `codex features list`); each unused feature costs context on every model call. `["apps", "plugins", "computer_use", "browser_use", "image_generation", "multi_agent", "goals", "realtime_conversation"]` cut the fixed context by about a third with codex-cli 0.167. A request that was pending or running when the bridge stopped runs again after the restart.
 - Web mirror: turns typed in ChatGPT itself are looked for every `mirror_interval_s`; after one is found, every `mirror_fast_s` (0 = off) for `mirror_fast_for_s` seconds. They are also posted right before each batch from the channel is sent, so a later channel message never skips them.
-- `python tests/test_engine.py` runs offline tests of the message paths (buffering, catch-up order, web mirror position, reports queue, Codex retry and timeouts, Gemini model choice and resume) with a fake Codex and a fake `agy`; no Discord, browser, Codex or Google account is used.
+- `.venv\Scripts\python tests\test_engine.py` runs offline tests of the message paths (buffering, catch-up order, web mirror position, reports queue, Codex retry and timeouts, Gemini model choice and resume) with a fake Codex and a fake `agy`; no Discord, browser, Codex or Google account is used.
 - Codex runs are stopped after `codex.stall_timeout_s` without output or `codex.turn_timeout_s` in total, and a failed run is retried `codex.retries` times, continuing its thread when there is one. When the CLI refuses the model or effort (Codex or Gemini), the run is repeated at once on the config's choice (a switch the member made is dropped), then on the CLI's own default, with one note in the channel. A failure notice mentions whoever asked for the turn, so an agent that asked can give the work to someone else.

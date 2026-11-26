@@ -18,8 +18,10 @@ config.json:
     "router_model": "",                the model that rates the request (default: models.easy)
     "router_fallback": "medium",       the tier used when rating fails
     "effort": "",                      optional --effort for the turns (low|medium|high|xhigh|max)
+    "premium": [],                     models or effort levels the member may switch to only in a turn the owner asked for
     "context_max_chars": 20000,
     "rotate_turns": 40,                start a new conversation after this many turns
+    "min_session_turns": 6,            a [[new-session]] request in a younger session is ignored
     "stall_timeout_s": 1800,           stop a run that produced no event for this long (0 = never)
     "turn_timeout_s": 10800,           stop a run that takes longer than this in total (0 = never)
     "retries": 1,                      automatic retries of a failed run (not for usage limits)
@@ -28,7 +30,7 @@ config.json:
   }
 A request can name the model itself: "@Gemini carbon ..." (any word of a configured slug such
 as hydrogen, argon, neon or carbon, or a tier name easy / medium / hard).
-Owner commands: !gemini status | !gemini stop | !gemini new
+Owner commands: !gemini status | !gemini stop | !gemini new | !gemini model|effort <value> | !gemini unlimit
 """
 from __future__ import annotations
 
@@ -233,6 +235,20 @@ class GeminiAgent(CliAgent):
         args += [str(a) for a in self.cfg.get("extra_args", [])]
         return args + self.prompt_args(prompt)
 
+    USAGE_KEYS = ("total_tokens", "input_tokens", "output_tokens", "thinking_tokens", "cache_read_tokens")
+
+    def turn_usage(self, usage: dict, conversation: str | None) -> dict:
+        """agy reports what the whole conversation has used so far: the turn's share is the growth
+        since the last run on that conversation."""
+        now = {k: int(usage.get(k) or 0) for k in self.USAGE_KEYS if k in usage}
+        seen = self.s.get("usage_seen") or {}
+        before = seen.get("usage", {}) if conversation and seen.get("conversation") == conversation else {}
+        if conversation and now:
+            self.s["usage_seen"] = {"conversation": conversation, "usage": now}
+        if any(v < int(before.get(k) or 0) for k, v in now.items()):  # not the same count any more
+            return now
+        return {k: v - int(before.get(k) or 0) for k, v in now.items()}
+
     def count_usage(self, usage: dict, model: str, what: str) -> int:
         n = int(usage.get("total_tokens") or sum(int(usage.get(k) or 0) for k in
                                                 ("input_tokens", "output_tokens", "thinking_tokens")))
@@ -249,7 +265,7 @@ class GeminiAgent(CliAgent):
         res = parse_events(lines)
         self.completed = res["status"] == "SUCCESS"
         self.progress = res["progress"] or bool(res["response"])
-        n = self.count_usage(res["usage"], self.turn_model, "turn")
+        n = self.count_usage(self.turn_usage(res["usage"], res["conversation"] or thread), self.turn_model, "turn")
         self.s.update(last_model=self.turn_model or "default", last_tier=self.turn_tier, last_tokens=n)
         error = res["error"]
         if thread and res["conversation"] and res["conversation"] != thread and not timed_out:
