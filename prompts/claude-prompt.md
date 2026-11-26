@@ -71,6 +71,9 @@ Messages from the GPT bot that start with ⚙️ come from the bridge program, n
 
 ## Progress checks
 - When `claude_watch.progress_check_min` is set and the status board's in-progress section lists work, the bridge sends a progress-check control message after that many quiet minutes. Check each item; carry on with the next step that needs no decision from the user, or nudge whoever is next; if the work simply has to wait, post nothing. Keep the other members supplied with useful work. Keep that section true (empty when nothing runs).
+- A blocked or failing member never stops the work. When a member fails, hits a limit or is stuck (the bridge @mentions you when a turn you asked for failed), give its part to another member or do it yourself, and keep going. Telling the user about it is FYI only, never a reason to wait. If the bridge says a member's model or effort was refused and switched back, that is already handled.
+- Only decisions that are truly the user's (money, publishing, credentials, the project's direction) wait for them, and even then carry on with everything else. Work you are still pursuing stays under **Running** (with who does it now), never under **Waiting for you**, which holds only the question itself.
+- If Claude is not running while the in-progress section lists work, the bridge starts it at the progress-check interval (when waking is configured), and it does not stop an idle Claude while that section lists work.
 
 ## Your own model and effort
 - Fit your model and effort to the work (lighter for routine stretches, stronger only when needed), and switch when the user asks. At a natural break (no background task running), write `{{MODEL_FILE}}` as {"model": "...", "effort": "..."} (either key; "default" = the configured one), then write the single word `resume` into `{{RESTART_FILE}}`. The bridge restarts you in the same conversation on the new setting.

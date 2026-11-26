@@ -183,7 +183,7 @@ Claude switches by writing `<runtime_dir>/claude-model.json` (`{"model": "...", 
 
 ### Progress checks
 
-With `claude_watch.progress_check_min` set, the bridge asks Claude to check on its work and carry on whenever the status board's in-progress section (`claude_watch.progress_heading`, default `In progress`) lists something and nobody has moved for that many minutes. Nothing is sent while that section is empty.
+With `claude_watch.progress_check_min` set, the bridge asks Claude to check on its work and carry on whenever the status board's in-progress section (`claude_watch.progress_heading`, default `In progress`) lists something and nobody has moved for that many minutes. Nothing is sent while that section is empty. While it lists something, an idle Claude is not stopped, and a Claude that is not running (crash, PC restart) is started at that interval (with `claude_watch.wake_on_mention` or an `ensure_script`); a paused group or a pending restart request is left alone.
 
 ## Caveats
 
@@ -213,4 +213,4 @@ Give each project its own profile: a JSON file with the same keys as `config.jso
 - `codex.disable_features` turns Codex feature flags off for the bridge's runs (see `codex features list`); each unused feature costs context on every model call. `["apps", "plugins", "computer_use", "browser_use", "image_generation", "multi_agent", "goals", "realtime_conversation"]` cut the fixed context by about a third with codex-cli 0.167. A request that was pending or running when the bridge stopped runs again after the restart.
 - Web mirror: turns typed in ChatGPT itself are looked for every `mirror_interval_s`; after one is found, every `mirror_fast_s` (0 = off) for `mirror_fast_for_s` seconds. They are also posted right before each batch from the channel is sent, so a later channel message never skips them.
 - `python tests/test_engine.py` runs offline tests of the message paths (buffering, catch-up order, web mirror position, reports queue, Codex retry and timeouts, Gemini model choice and resume) with a fake Codex and a fake `agy`; no Discord, browser, Codex or Google account is used.
-- Codex runs are stopped after `codex.stall_timeout_s` without output or `codex.turn_timeout_s` in total, and a failed run is retried `codex.retries` times, continuing its thread when there is one.
+- Codex runs are stopped after `codex.stall_timeout_s` without output or `codex.turn_timeout_s` in total, and a failed run is retried `codex.retries` times, continuing its thread when there is one. When the CLI refuses the model or effort (Codex or Gemini), the run is repeated at once on the config's choice (a switch the member made is dropped), then on the CLI's own default, with one note in the channel. A failure notice mentions whoever asked for the turn, so an agent that asked can give the work to someone else.

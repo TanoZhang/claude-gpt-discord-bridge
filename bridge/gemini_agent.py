@@ -186,7 +186,10 @@ class GeminiAgent(CliAgent):
         return "", "default"
 
     async def prepare_turn(self, context: str) -> None:
-        self.turn_model, self.turn_tier = await self.pick_model(context)
+        if self.bare:  # agy refused the configured model or effort: its own default this turn
+            self.turn_model, self.turn_tier = "", "default"
+        else:
+            self.turn_model, self.turn_tier = await self.pick_model(context)
         self.log.info("gemini: model %s (%s)", self.turn_model or "default", self.turn_tier)
 
     # -- the CLI
@@ -204,10 +207,25 @@ class GeminiAgent(CliAgent):
     def prompt_stdin(self, prompt: str) -> bytes:
         return (json.dumps({"event": "user", "message": {"content": prompt}}, ensure_ascii=False) + "\n").encode("utf-8")
 
+    def with_effort(self, model: str, effort: str) -> tuple[str, str]:
+        """(model, --effort value). Most agy slugs carry the effort as their last part
+        (gemini-4-hydrogen-high), and agy refuses a different --effort next to such a slug; so the
+        effort replaces that part of the slug instead (hydrogen-high + low -> hydrogen-low)."""
+        base, _, tail = model.rpartition("-")
+        if base and tail.lower() in self.efforts:
+            return (f"{base}-{effort}" if effort else model), ""
+        return model, effort
+
+    def used_choice(self) -> bool:
+        return bool(self.turn_model or self.run_effort())
+
     def command_args(self, prompt: str, thread: str | None) -> list[str]:
-        args = self.base_args(self.turn_model)
-        if self.current_effort():
-            args += ["--effort", self.current_effort()]
+        model, effort = self.with_effort(self.turn_model, self.run_effort())
+        if model != self.turn_model:
+            self.log.info("gemini: effort %s -> model %s", self.run_effort(), model)
+        args = self.base_args(model)
+        if effort:
+            args += ["--effort", effort]
         perm = self.cfg.get("permissions", "auto")
         args += ["--dangerously-skip-permissions"] if perm == "skip" else ["--mode", str(perm)]
         if thread:

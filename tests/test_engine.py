@@ -709,8 +709,15 @@ async def test_switching(tmp: Path) -> None:
     check("switch: model and effort are kept", agent.current_model() == "gemini-4-hydrogen-low"
           and agent.current_effort() == "xhigh", f"{agent.current_model()} {agent.current_effort()}")
     calls = await gemini_turn(agent, "@Gemini go on")
-    check("switch: the next run uses them", arg(calls[-1], "--model") == "gemini-4-hydrogen-low"
-          and arg(calls[-1], "--effort") == "xhigh", str(calls[-1]["args"]))
+    # agy refuses --effort next to a slug that carries its own effort: the effort goes into the slug
+    check("switch: the next run uses them", arg(calls[-1], "--model") == "gemini-4-hydrogen-xhigh"
+          and arg(calls[-1], "--effort") is None, str(calls[-1]["args"]))
+    check("switch: effort into a suffixed slug", agent.with_effort("gemini-4-hydrogen-high", "low")
+          == ("gemini-4-hydrogen-low", ""), str(agent.with_effort("gemini-4-hydrogen-high", "low")))
+    check("switch: no effort keeps the slug", agent.with_effort("gemini-4-hydrogen-high", "")
+          == ("gemini-4-hydrogen-high", ""))
+    check("switch: a slug without an effort part gets --effort",
+          agent.with_effort("claude-opus-4-6-thinking", "high") == ("claude-opus-4-6-thinking", "high"))
 
     # 2. in a turn someone else asked for, the member still picks its own setting, but not a premium one
     d = tmp / "gem2"; d.mkdir()
@@ -785,13 +792,215 @@ async def test_new_session(tmp: Path) -> None:
           and "--conversation" in calls[-1]["args"], str(calls[-1]["args"]))
 
 
+async def test_self_heal(tmp: Path) -> None:
+    # 1. a stored switch the CLI refuses: dropped for good, the config's model is used, at once
+    d = tmp / "stored"; d.mkdir()
+    agent = make_gemini(d, "easy_reject", model="gemini-4-hydrogen-high")
+    agent.s["model"] = "gemini-bogus-x"
+    t0 = time.time()
+    calls = await gemini_turn(agent)
+    sent = agent.bridge.channel.sent
+    check("heal: a refused stored model is retried on the config's", [arg(c, "--model") for c in calls]
+          == ["gemini-bogus-x", "gemini-4-hydrogen-high"], str([c["args"] for c in calls]))
+    check("heal: the refused switch is dropped for good", "model" not in agent.s and agent.current_model()
+          == "gemini-4-hydrogen-high", str(agent.s.get("model")))
+    check("heal: the switch back is said once", sum("refused" in (x or "") for x in sent) == 1 and "gemini-bogus-x" in sent[0],
+          str(sent))
+    check("heal: the turn's answer is posted, no failure", sent[-1:] == ["**[Gemini]** final answer"]
+          and not any("did not finish" in (x or "") for x in sent), str(sent))
+    check("heal: no 20 s retry wait for a refused model", time.time() - t0 < 15, f"{time.time() - t0:.0f}s")
+
+    # 2. the config's own model is refused: this turn runs on agy's default (no --model, no --effort)
+    d = tmp / "config"; d.mkdir()
+    agent = make_gemini(d, "easy_reject", model="gemini-bogus-cfg", effort="low")
+    calls = await gemini_turn(agent)
+    check("heal: a refused config model falls back to the CLI default", len(calls) == 2 and arg(calls[1], "--model") is None
+          and arg(calls[1], "--effort") is None, str([c["args"] for c in calls]))
+    check("heal: the config's choice is not changed", agent.current_model() == "gemini-bogus-cfg"
+          and agent.current_effort() == "low", f"{agent.current_model()} {agent.current_effort()}")
+    check("heal: the answer is posted after the fallback", agent.bridge.channel.sent[-1:] == ["**[Gemini]** final answer"],
+          str(agent.bridge.channel.sent))
+    calls = await gemini_turn(agent, "@Gemini next")
+    check("heal: the next turn tries the config again", arg(calls[2], "--model") == "gemini-bogus-cfg", str(calls[2]["args"]))
+
+    # 3. refused whatever it gets: bounded, and reported as a failure
+    d = tmp / "all"; d.mkdir()
+    agent = make_gemini(d, "easy_rejectall", model="gemini-bogus-cfg")
+    real_sleep = asyncio.sleep
+    asyncio.sleep = lambda s, *a: real_sleep(min(s, 0.05))
+    try:
+        calls = await gemini_turn(agent)
+    finally:
+        asyncio.sleep = real_sleep
+    check("heal: a CLI that refuses everything is not retried forever", len(calls) == 3, str(len(calls)))
+    check("heal: then the failure is reported", "did not finish" in (agent.bridge.channel.sent or [""])[-1],
+          str(agent.bridge.channel.sent))
+
+    # 4. Codex refuses a stored model: back to the default (no -m)
+    d = tmp / "codex"; d.mkdir()
+    codex = make_codex(d, "badmodel")
+    codex.s["model"] = "bogus-model"
+    codex.remember("User", "@Codex do it")
+    codex.pending = True
+    codex.trigger.set()
+    await run_one_turn(codex)
+    calls = json.loads((d / "calls.json").read_text())
+    check("heal: Codex retries without the refused model", len(calls) == 2 and "bogus-model" in calls[0]["args"]
+          and "-m" not in calls[1]["args"], str([c["args"] for c in calls]))
+    check("heal: Codex's answer is posted", codex.bridge.channel.sent[-1:] == ["**[Codex]** final answer"],
+          str(codex.bridge.channel.sent))
+    check("heal: the patterns know both CLIs", all(cli.CHOICE_RE.search(x) for x in (
+        'invalid model selection (--model "gemini-4-hydrogen-high" --effort "low"): --model gemini-4-hydrogen-high conflicts with --effort=low',
+        "The 'gpt-x' model is not supported when using Codex with a ChatGPT account."))
+          and not cli.CHOICE_RE.search("conversation abc not found") and not cli.CHOICE_RE.search("boom"))
+
+
+async def test_failure_mention(tmp: Path) -> None:
+    # 1. a member's failed turn mentions whoever asked: Claude and the owner here
+    d = tmp / "fail"; d.mkdir()
+    agent = make_codex(d, "fail", retries=0)
+    await agent.observe(FakeMsg(901, author_id=20, bot=True), "Claude", "@Codex do it", may_trigger=True)
+    await agent.observe(FakeMsg(902, author_id=10), "User", "@Codex and this", may_trigger=True)
+    check("mention: the requesters are kept with the request", agent.s.get("requesters") == [20, 10], str(agent.s.get("requesters")))
+    await run_one_turn(agent)
+    sent = agent.bridge.channel.sent
+    check("mention: the failure notice mentions the requesters", sent and "<@20>" in sent[-1] and "<@10>" in sent[-1]
+          and "did not finish" in sent[-1], str(sent))
+    check("mention: the requesters are forgotten after the turn", "requesters" not in agent.s, str(agent.s.get("requesters")))
+
+    # 2. a good turn mentions nobody extra
+    d = tmp / "ok"; d.mkdir()
+    agent = make_codex(d, "ok")
+    await agent.observe(FakeMsg(903, author_id=20, bot=True), "Claude", "@Codex do it", may_trigger=True)
+    await run_one_turn(agent)
+    check("mention: a good answer adds no mention", agent.bridge.channel.sent[-1:] == ["**[Codex]** final answer"],
+          str(agent.bridge.channel.sent))
+
+    # 3. the AI-streak cap still holds: a bot's request at the cap starts nothing and records no requester
+    d = tmp / "cap"; d.mkdir()
+    agent = make_codex(d, "fail", retries=0)
+    agent.bridge.streak = agent.bridge.cap
+    await agent.observe(FakeMsg(904, author_id=40, bot=True), "Gemini", "@Codex do it", may_trigger=True)
+    check("mention: at the cap a bot's request starts no turn", not agent.pending and "requesters" not in agent.s
+          and not agent.trigger.is_set(), str(agent.s))
+
+    # 4. a post the GPT bot made for a member without its own bot counts as that member's request
+    gem = make_gemini(d, "easy_ok")
+    agent.bridge.user = type("U", (), {"id": 50})()
+    agent.bridge.members = [agent, gem]
+    m = FakeMsg(905, author_id=50, bot=True, content="**[Gemini]** @Codex please check")
+    check("mention: a GPT-bot post for Gemini is Gemini's request", agent.requester_of(m) == 40, str(agent.requester_of(m)))
+
+
+async def test_progress_wake(tmp: Path) -> None:
+    b = make_bridge(tmp, claude_watch={"progress_check_min": 15, "idle_stop_min": 30, "wake_on_mention": True,
+                                       "work_dir": str(tmp), "progress_heading": "Doing"})
+    gb.STATUS_FILE = tmp / "status.md"
+    gb.STATUS_FILE.write_text("**Doing**\n- rerun the strategy\n\n**Done**\n- other\n", encoding="utf-8")
+    woken, controls, running = [], [], [False]
+
+    async def fake_running():
+        return running[0]
+
+    async def fake_wake(msg, text=None):
+        woken.append((msg, text))
+        return True
+
+    async def fake_control(tag, text):
+        controls.append((tag, text))
+
+    b.claude_running, b.wake_claude, b.control, b._cw_find = fake_running, fake_wake, fake_control, lambda: None
+    now = time.time()
+    b.cw_progress_sent = 0
+    await b.progress_check(now)
+    check("wake: a stopped Claude is woken while the board lists work", len(woken) == 1 and woken[0][0] is None
+          and woken[0][1] == gb.S("progress_claude", min=15), str(woken))
+    await b.progress_check(now + 60)
+    check("wake: not again before the next interval", len(woken) == 1, str(len(woken)))
+
+    b.cw_progress_sent = 0
+    b.halted = {"since": now}
+    await b.progress_check(now)
+    check("wake: not while the group is halted", len(woken) == 1, str(len(woken)))
+    b.halted = None
+    (tmp / "restart.request").write_text("", encoding="utf-8")
+    await b.progress_check(now)
+    check("wake: not while a restart is requested", len(woken) == 1, str(len(woken)))
+    (tmp / "restart.request").unlink()
+    gb.STATUS_FILE.write_text("**Doing**\n\n**Done**\n- other\n", encoding="utf-8")
+    await b.progress_check(now)
+    check("wake: not when nothing is in progress", len(woken) == 1, str(len(woken)))
+
+    # running and quiet: the usual progress prompt, no wake
+    gb.STATUS_FILE.write_text("**Doing**\n- rerun the strategy\n", encoding="utf-8")
+    transcript = tmp / "t.jsonl"
+    transcript.write_text("{}", encoding="utf-8")
+    os.utime(transcript, (now - 3600, now - 3600))
+    b._cw_find = lambda: transcript
+    running[0] = True
+    await b.progress_check(now)
+    check("wake: a running, quiet Claude gets the progress prompt", len(woken) == 1 and controls
+          and controls[-1][0] == gb.S("tag_progress"), str(controls))
+
+    # the idle stop leaves Claude running while the board lists work
+    real_exec = asyncio.create_subprocess_exec
+    spawned = []
+
+    async def fake_exec(*a, **kw):
+        spawned.append(a)
+        raise RuntimeError("no process in tests")
+
+    asyncio.create_subprocess_exec = fake_exec
+    try:
+        await b.stop_idle_claude()
+        check("wake: no idle stop while work is in progress", not spawned, str(spawned))
+        gb.STATUS_FILE.write_text("**Doing**\n\n", encoding="utf-8")
+        try:
+            await b.stop_idle_claude()
+        except RuntimeError:
+            pass
+        check("wake: the idle stop still works with nothing in progress", len(spawned) == 1, str(spawned))
+    finally:
+        asyncio.create_subprocess_exec = real_exec
+
+    # the real wake path with no message: starts Claude and hands it the progress prompt
+    b2 = make_bridge(tmp, claude_watch={"progress_check_min": 15, "wake_on_mention": True, "work_dir": str(tmp)})
+    states = iter([False, True, True])
+
+    async def running_seq():
+        return next(states, True)
+
+    class Proc:
+        async def wait(self):
+            return 0
+
+    async def fake_exec2(*a, **kw):
+        return Proc()
+
+    real_sleep = asyncio.sleep
+    b2.claude_running, b2.control = running_seq, fake_control
+    controls.clear()
+    asyncio.create_subprocess_exec = fake_exec2
+    asyncio.sleep = lambda s, *a: real_sleep(0)
+    try:
+        ok = await b2.wake_claude(None, "check the board")
+    finally:
+        asyncio.create_subprocess_exec, asyncio.sleep = real_exec, real_sleep
+    check("wake: a wake without a message comes up", ok is True, str(ok))
+    check("wake: it gets the progress hand-over", controls and controls[-1][0] == gb.S("tag_progress")
+          and "check the board" in controls[-1][1], str(controls))
+    await b.close()
+    await b2.close()
+
+
 async def main() -> None:
     logging.basicConfig(level=logging.CRITICAL)
     with tempfile.TemporaryDirectory() as t:
         tmp = Path(t)
         for i, test in enumerate((test_buffer, test_halt, test_web_turns, test_mirror_rules, test_page_loads, test_reports, test_codex_buffer, test_codex_runs,
                                   test_gemini_routing, test_gemini_runs,
-                                  test_switching, test_progress_board, test_new_session)):
+                                  test_switching, test_progress_board, test_new_session,
+                                  test_self_heal, test_failure_mention, test_progress_wake)):
             d = tmp / str(i)
             d.mkdir()
             try:

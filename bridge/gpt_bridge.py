@@ -212,6 +212,8 @@ DEFAULT_STRINGS = {
     "agent_model_words": "model|effort|reasoning",  # a request matching this regex gets the switch help
     "agent_switch_help": "[Your model and effort] You run on model {model}, effort {effort}. Pick the model and effort that fit the task: lighter for simple work, stronger only when the work needs it. To switch, write [[model:NAME]] and/or [[effort:LEVEL]] in your reply (NAME from {models}; LEVEL one of: {efforts}; \"default\" returns to the configured one); the bridge applies it from your next turn and says so in the channel. Only when {user} asks for it: {premium}. Do not change any config file yourself.",
     "agent_switched": "({name} uses {what} {value} from its next turn.)",
+    "agent_choice_reset": "({name}'s CLI refused {choice}: dropped it; {name} now runs on model {model}, effort {effort}, and the turn goes on.)",
+    "agent_choice_bare": "({name}'s CLI refused the configured {choice}: this turn runs on the CLI's own default model.)",
     "agent_switch_bad": "({name}: {what} \"{value}\" is not one of: {choices}. Nothing changed.)",
     "agent_switch_refused": "({name} wanted {value}, which only the owner can ask for. Nothing changed.)",
     "fresh_words": "fresh",  # `!gpt new <word>`: space-separated words that mean "no handoff summary"
@@ -219,6 +221,8 @@ DEFAULT_STRINGS = {
     "tag_context": "[Context]", "tag_handoff": "[Handoff]",
     "tag_switched": "[Model]",
     "tag_progress": "[Progress check]",
+    "wake_progress": "You are a freshly started session: you were not running while the status board lists work in progress, so the bridge started you. Read `{handoff}` first and check `git worktree list`. Then: {text}",
+    "wake_progress_resumed": "You were stopped (idle or crashed) while the status board lists work in progress, and have just been resumed in the same session. {text}",
     "progress_claude": "Nobody has moved for {min} min while the status board lists work in progress. Check where each item stands (background jobs, Codex or Gemini tasks); carry on with the next step that needs no decision from the user, and nudge Codex or Gemini in the log if their part is due. Post only what changed (results for the user in the main channel, details in the log); if nothing changed and nothing is due, post nothing.",
     "switched_claude": "You were restarted in the same conversation, now on {setting}. Say so in one line and continue where you stopped.",
     "claude_login_expired": "⚠️ Claude's login has expired, so it cannot answer. Run `claude` in a terminal, enter `/login`, then @Claude again. GPT and Codex are not affected.",
@@ -2243,16 +2247,28 @@ def make_bridge(cfg: dict, state: dict):
         async def progress_check(self, now: float) -> None:
             """While the status board lists work in progress and Claude has been quiet for
             claude_watch.progress_check_min, ask it to check on that work and carry on, so the
-            user does not have to. Nothing is sent while the board shows nothing in progress."""
+            user does not have to. Nothing is sent while the board shows nothing in progress.
+            A Claude that is not running (crashed, PC restarted) is started for it, so pending work
+            never waits for someone to call Claude."""
             if (self.halted or self.waking or self.cw_paused_until or now - self.cw_progress_sent < self.cw_progress_s
                     or (self.cw_work / "restart.request").exists()):
                 return
             f = self._cw_find()
-            if f is None or now - f.stat().st_mtime < self.cw_progress_s:
-                return  # no session yet, or Claude was active recently
+            if f is not None and now - f.stat().st_mtime < self.cw_progress_s:
+                return  # Claude was active recently
             items = self.in_progress()
-            if not items or not await self.claude_running():
+            if not items:
                 return
+            if not await self.claude_running():
+                if not self.cw_wake:  # waking is configured (ensure_script or wake_on_mention)
+                    return
+                self.cw_progress_sent = now
+                log.info("progress check: Claude is not running with %d items in progress; waking it", len(items))
+                if not await self.wake_claude(None, S("progress_claude", min=int(self.cw_progress_s // 60))):
+                    self.cw_progress_sent = now + 3 * self.cw_progress_s  # it did not come up: try again later, not every round
+                return
+            if f is None:
+                return  # running, but no transcript yet: it has only just started
             self.cw_progress_sent = now
             log.info("progress check: Claude quiet for %d min with %d items in progress",
                      (now - f.stat().st_mtime) // 60, len(items))
@@ -2325,8 +2341,11 @@ def make_bridge(cfg: dict, state: dict):
             """Stop this project's Claude session after claude_watch.idle_stop_min minutes without
             activity (saves memory, like the idle browser). The session id is kept, so the next
             @Claude resumes the same conversation. A shell or script still running under Claude
-            counts as work in progress."""
+            counts as work in progress, and so does an item under the status board's in-progress
+            heading: the progress checks keep such work moving, a stopped Claude would not."""
             if self.waking or self.halted or (self.cw_work / "restart.request").exists():
+                return
+            if self.cw_progress_s and self.in_progress():
                 return
             name = (self.cw_name or "").replace("'", "''")
             ps = ("$all = Get-CimInstance Win32_Process; "
@@ -2368,29 +2387,31 @@ def make_bridge(cfg: dict, state: dict):
             log.info("Claude was idle for %d min; stopped it (session %s kept for resume)",
                      (time.time() - last) // 60, f.stem if f is not None else "none")
 
-        async def wake_claude(self, msg, text: str | None = None) -> None:
+        async def wake_claude(self, msg, text: str | None = None) -> bool:
             """Someone @mentioned Claude but its session is not running (PC restarted, crash):
             start it with the ensure script, then hand it the handoff and the message it missed.
-            Only active when config claude_watch.ensure_script is set."""
+            msg None: woken by the progress check for the work on the status board; `text` says what
+            to do. Only active when config claude_watch.ensure_script is set. True when it came up."""
             if self.waking:  # already starting: hand this message over too, once Claude is up
-                if msg.id not in [m.id for m, _ in self.wake_missed]:
+                if msg is not None and msg.id not in [m.id for m, _ in self.wake_missed]:
                     self.wake_missed.append((msg, text))
-                return
+                return False
             if not self.cw_ensure:
-                return
+                return False
             if await self.claude_running():
                 # still waiting at its startup question: tell the person who called it, at most every 5 minutes
-                if self.cw_stuck and not msg.author.bot and time.time() - self.cw_stuck_noted > 300:
+                if self.cw_stuck and msg is not None and not msg.author.bot and time.time() - self.cw_stuck_noted > 300:
                     self.cw_boot_check_at = time.time()
-                return
+                return False
             if self.cw_paused_until and time.time() < self.cw_paused_until:
                 when = time.strftime("%H:%M", time.localtime(self.cw_paused_until))
-                await self.note(S("claude_asleep_limit", when=when))
-                return
+                if msg is not None:
+                    await self.note(S("claude_asleep_limit", when=when))
+                return False
             self.waking = True
             try:
-                log.info("Claude is not running; waking it for message %s", msg.id)
-                if not msg.author.bot:  # only a person who called Claude is told; Discord's status dot shows the rest
+                log.info("Claude is not running; waking it for %s", f"message {msg.id}" if msg is not None else "the work in progress")
+                if msg is not None and not msg.author.bot:  # only a person who called Claude is told; Discord's status dot shows the rest
                     await self.note(S("claude_waking"))
                 ps = ""
                 if self.cw_lock:
@@ -2409,7 +2430,7 @@ def make_bridge(cfg: dict, state: dict):
                 await asyncio.sleep(50)  # the new session needs a moment to connect to Discord
                 if not await self.claude_running():
                     await self.note(S("claude_wake_failed"))
-                    return
+                    return False
                 try:  # a logged-out CLI stays open at its prompt and never answers
                     run_log = self.cw_work / "logs" / "claude-run.log"
                     tail = run_log.read_bytes()[-20000:].decode("utf-8", "replace") if run_log.exists() else ""
@@ -2419,15 +2440,21 @@ def make_bridge(cfg: dict, state: dict):
                 if re.search(r"not logged in|run /login", tail, re.I):
                     log.warning("Claude started but is not logged in")
                     await self.note(S("claude_not_logged_in"))
-                    return
+                    return False
                 self.cw_file, self.cw_ctx, self.cw_nudged_at = None, 0, time.time()
                 handoff = self.cw_work / "handoff.md"
-                where = f"#{getattr(self.log_channel, 'name', 'log')}" if self.is_log(msg) else f"#{getattr(self.channel, 'name', 'channel')}"
-                await self.control(S("tag_handoff"), S("wake_claude_resumed" if resumed else "wake_claude",
-                                                       handoff=handoff, where=where, text=(text or self.clean(msg))[:600]))
+                if msg is None:
+                    await self.control(S("tag_progress"), S("wake_progress_resumed" if resumed else "wake_progress",
+                                                            handoff=handoff, text=text or ""))
+                else:
+                    where = f"#{getattr(self.log_channel, 'name', 'log')}" if self.is_log(msg) else f"#{getattr(self.channel, 'name', 'channel')}"
+                    await self.control(S("tag_handoff"), S("wake_claude_resumed" if resumed else "wake_claude",
+                                                           handoff=handoff, where=where, text=(text or self.clean(msg))[:600]))
                 await self.flush_missed()
+                return True
             except Exception:
                 log.exception("waking Claude failed")
+                return False
             finally:
                 self.waking = False
                 self.wake_missed = []

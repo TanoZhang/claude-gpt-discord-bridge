@@ -30,6 +30,11 @@ if scenario == "hang":
 elif scenario == "fail":
     emit(type="turn.failed", error={"message": "boom"})
     sys.exit(1)
+elif scenario == "badmodel" and any("bogus" in a for a in args):
+    msg = "The 'bogus-model' model is not supported when using Codex with a ChatGPT account."
+    emit(type="error", message=msg)
+    emit(type="turn.failed", error={"message": msg})
+    sys.exit(1)
 elif scenario == "cut_then_ok" and len(calls) == 1:
     emit(type="turn.started")
     message("working on it")

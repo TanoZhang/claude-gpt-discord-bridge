@@ -5,6 +5,7 @@
 Records every call (arguments and stdin) in <state dir>/calls.json and prints stream-json
 events like agy. A call with `--mode plan` is the bridge rating a request; the scenario's
 first word is the rating ("hard_ok" rates hard, "junk_..." rates nonsense).
+"reject" refuses a model slug with "bogus" in it, "rejectall" every run.
 Like agy 1.5.17, `--conversation` with an unknown id ("lost") warns on stderr and starts a new
 conversation instead of failing.
 """
@@ -40,6 +41,14 @@ if "Rate how hard" in calls[-1]["stdin"]:
     emit("init", conversation_id="conv-router", init={"model": "x"})
     result("SUCCESS", "Probably not much." if rating == "junk" else rating.capitalize() + ".", conversation="conv-router", tokens=20)
     sys.exit(0)
+model = args[args.index("--model") + 1] if "--model" in args else ""
+if behaviour == "rejectall" or (behaviour == "reject" and "bogus" in model):
+    # like agy 1.5.17 when it refuses the model or the effort: before any conversation
+    err = (f'invalid model selection (--model "{model}" --effort ""): model {model} is not recognized '
+           "as a known model or custom model in settings")
+    print("error: " + err, file=sys.stderr)
+    result("ERROR", error=err, conversation="", tokens=0)
+    sys.exit(1)
 conv = "conv-1"
 if behaviour == "lost":
     conv = "conv-2"

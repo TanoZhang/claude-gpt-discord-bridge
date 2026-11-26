@@ -109,10 +109,10 @@ class CodexAgent(CliAgent):
     def command_args(self, thread: str | None) -> list[str]:
         sandbox = self.cfg.get("sandbox", "workspace-write")
         args = [find_codex(self.cfg.get("executable")), "-a", "never", "-s", sandbox, "-C", str(self.workdir)]
-        if self.current_model():
-            args += ["-m", self.current_model()]
-        if self.current_effort():
-            args += ["-c", f'model_reasoning_effort="{self.current_effort()}"']
+        if self.run_model():  # none when Codex refused the configured one (see CliAgent.drop_choice)
+            args += ["-m", self.run_model()]
+        if self.run_effort():
+            args += ["-c", f'model_reasoning_effort="{self.run_effort()}"']
         # Each feature brings tool descriptions that are sent with every model call. A group
         # member that edits code and runs commands needs few of them: turning the rest off
         # cut the fixed context by about a third (codex-cli 0.167).

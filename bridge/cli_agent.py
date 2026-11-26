@@ -21,6 +21,12 @@ FILE_RE = re.compile(r"\[\[discord-file:([^\]]+)\]\]")
 LIMIT_RE = re.compile(r"usage.?limit|rate.?limit|quota|hit your .*limit|resource.?exhausted|out of credits", re.I)
 RESUME_LOST_RE = re.compile(r"not found|no (such )?(session|thread|rollout|conversation)|unknown conversation|"
                             r"invalid conversation", re.I)
+# The CLI refused the model or effort it was given, e.g. agy: `invalid model selection (...): --model X
+# conflicts with --effort=low` / `model X is not recognized` / `invalid --effort "ultra"`; Codex:
+# `The 'X' model is not supported when using Codex with a ChatGPT account`.
+CHOICE_RE = re.compile(r"invalid model selection|invalid --?effort|unknown model|unsupported (value|model)|"
+                       r"\bmodel\b.{0,80}\b(is not supported|not recognized|does not exist|not available)|"
+                       r"reasoning[._ ]effort.{0,40}\b(unsupported|not supported|invalid)", re.I)
 NO_WINDOW = 0x08000000 if os.name == "nt" else 0
 # In a reply: [[model:NAME]] / [[effort:LEVEL]] switches the member from its next turn ("default" = the config's).
 SWITCH_RE = re.compile(r"\[\[(model|effort):\s*([^\]\s]+)\s*\]\]", re.I)
@@ -74,6 +80,7 @@ class CliAgent:
         self.process = None
         self.poster = None  # a REST-only client logged in as the member's bot
         self.attachments: list = []  # Discord attachments since the last turn (not persisted)
+        self.bare = False  # this turn runs without --model / --effort: the CLI refused the configured ones
         s = self.state.setdefault(self.key, {})
         s.setdefault("buffer", [])
 
@@ -99,6 +106,46 @@ class CliAgent:
 
     def current_effort(self) -> str:
         return str(self.s.get("effort") or self.cfg.get("effort") or "")
+
+    def run_model(self) -> str:
+        """The model this run passes to the CLI: none when the CLI refused the configured one."""
+        return "" if self.bare else self.current_model()
+
+    def run_effort(self) -> str:
+        return "" if self.bare else self.current_effort()
+
+    def used_choice(self) -> bool:
+        """Whether the last run passed a model or effort of ours (a subclass may pick it per turn)."""
+        return bool(self.run_model() or self.run_effort())
+
+    def drop_choice(self) -> str | None:
+        """The CLI refused the model or effort. First a switch kept in the state is dropped for good
+        (that is what was refused) and the config's choice is used; if that is refused too, this
+        turn runs on the CLI's own default. Returns the note for the channel, or None when there is
+        nothing left to drop."""
+        stored = [(w, self.s.pop(w)) for w in ("model", "effort") if self.s.get(w)]
+        if stored:
+            self.save()
+            self.log.warning("%s: the CLI refused %s; back to the config's choice", self.key, stored)
+            return self.t("choice_reset", choice=", ".join(f"{w} {v}" for w, v in stored),
+                          model=self.current_model() or self.t("default_value"),
+                          effort=self.current_effort() or self.t("default_value"))
+        if not self.bare and self.used_choice():
+            choice = " / ".join(x for x in (self.current_model(), self.current_effort()) if x) or "?"
+            self.bare = True
+            self.log.warning("%s: the CLI refused the configured %s; this turn runs on its default", self.key, choice)
+            return self.t("choice_bare", choice=choice)
+        return None
+
+    def requester_of(self, msg) -> int:
+        """Who asked for a turn: the author, or the member a GPT-bot post was made for."""
+        user = getattr(self.bridge, "user", None)
+        if user is not None and msg.author.id == user.id:
+            content = msg.content or ""
+            for other in getattr(self.bridge, "members", []):
+                if other is not self and other.bot_id and content.startswith(other.prefix):
+                    return other.bot_id
+        return msg.author.id
 
     def switch(self, what: str, value: str) -> str:
         """Set the model or effort for the next turns; 'default' returns to the config. Returns the note."""
@@ -214,8 +261,11 @@ class CliAgent:
                 return
             self.log.info("%s: requested by %s", self.key, speaker)
             self.pending = True
+            # requesters: mentioned if the turn fails, so a member that asked is woken and can reroute
+            who = self.requester_of(msg)
+            requesters = [i for i in self.s.get("requesters", []) if i != who] + [who]
             # by_owner: only a turn the owner asked for may switch the member's model or effort
-            self.s.update(pending=True, target=self.target_id, request=text[-2000:],
+            self.s.update(pending=True, target=self.target_id, request=text[-2000:], requesters=requesters[-3:],
                           by_owner=msg.author.id == getattr(self.bridge, "owner_id", None))  # survives a bridge restart
             self.trigger.set()
         self.save()
@@ -272,7 +322,7 @@ class CliAgent:
                 else:
                     self.log.exception("%s turn failed", self.key)
                     try:
-                        await self.post(target, self.t("failed", err=str(e)[:300]), plain=True)
+                        await self.post(target, self.failure_text(str(e)), plain=True)
                     except Exception:  # Discord trouble must not end this worker: nobody would run the member again
                         self.log.exception("%s: could not post the failure notice", self.key)
             finally:
@@ -280,9 +330,16 @@ class CliAgent:
                 self.busy = False
                 self.process = None
                 if not self.closing and not self.pending:
-                    for k in ("pending", "target", "request", "by_owner"):
+                    for k in ("pending", "target", "request", "by_owner", "requesters"):
                         self.s.pop(k, None)
                 self.save()
+
+    def failure_text(self, err: str) -> str:
+        """The failure notice, mentioning whoever asked for the turn (the owner, Claude, GPT or a
+        member): a bot that asked is woken by it and can give the work to someone else. A bot that
+        is mentioned starts a turn only under the bridge's AI-streak cap, as for any bot message."""
+        who = " ".join(f"<@{i}>" for i in self.s.get("requesters", []) if i and i != self.bot_id)
+        return (who + " " if who else "") + self.t("failed", err=err[:300])
 
     def build_prompt(self, context: str, files: list[Path], target: int, fresh: bool) -> str:
         S = self.S
@@ -395,10 +452,12 @@ class CliAgent:
         if self.stopped or self.closing:  # stopped while the attachments were downloading
             raise RuntimeError("stopped")
         tries = 1 + max(0, int(self.cfg.get("retries", 1)))
+        self.bare = False
         async with self.typing(target):
             await self.prepare_turn(context)
             prompt = self.build_prompt(context, files, target, fresh=not thread)
-            for attempt in range(tries):
+            attempt = 0
+            while True:
                 new_thread, messages, error, stderr = await self.exec_cli(prompt, thread)
                 if thread and error and not messages and RESUME_LOST_RE.search(error + stderr):
                     self.log.warning("%s: session %s cannot be resumed (%s); starting a new one", self.key, thread, error)
@@ -409,8 +468,22 @@ class CliAgent:
                     self.s.update(thread=new_thread, turns=0)
                     thread = new_thread
                 failed = bool(error) and not (messages and self.completed)
-                if not failed or self.stopped or LIMIT_RE.search(error) or attempt == tries - 1:
+                if not failed or self.stopped:
                     break
+                if CHOICE_RE.search(error + "\n" + stderr):
+                    # The same arguments would be refused again: step back to the config's model and
+                    # effort, then to the CLI's default, saying so; this does not use up a retry.
+                    note = self.drop_choice()
+                    if note:
+                        try:
+                            await self.post(target, note, plain=True)
+                        except Exception:
+                            self.log.exception("%s: could not post the model note", self.key)
+                        await self.prepare_turn(context)
+                        continue
+                if LIMIT_RE.search(error) or attempt >= tries - 1:
+                    break
+                attempt += 1
                 # One automatic retry. If the failed run got as far as a session, that session already
                 # holds the whole prompt: continue it with one line instead of sending it all again.
                 self.log.warning("%s: turn failed (%s); retrying in 20 s", self.key, error[:200])
